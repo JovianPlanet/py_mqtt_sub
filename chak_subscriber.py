@@ -12,7 +12,7 @@ def print_mixing_tank(payload):
     print("--- Mixing Tank ---")
     print(f"  Temperature      : {payload['temperature']} °C")
     print(f"  PH               : {payload['ph']}")
-    print(f"  Level            : {payload['level']} %")
+    print(f"  Level            : {payload['level']} mm")
     print(f"  Dissolved Oxygen : {payload['dissolved_oxygen']} mg/L")
 
 
@@ -20,7 +20,7 @@ def print_distribution_tank(bed, payload):
     print(f"--- Distribution Tank | {bed} ---")
     print(f"  Temperature  : {payload['temperature']} °C")
     print(f"  PH           : {payload['ph']}")
-    print(f"  Level        : {payload['level']} %")
+    print(f"  Level        : {payload['level']} mm")
     print(f"  Conductivity : {payload['conductivity']} µS/cm")
 
 
