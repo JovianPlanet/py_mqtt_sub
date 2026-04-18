@@ -1,12 +1,15 @@
 import json
+import os
 import requests
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
-BROKER = "localhost"
-PORT = 1883
+load_dotenv()
 
-API_BASE_URL = "http://<YOUR_SERVER_IP>:8000"
+BROKER = os.getenv("BROKER", "localhost")
+PORT = int(os.getenv("PORT", 1883))
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 MIXING_TANK_TOPIC = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
