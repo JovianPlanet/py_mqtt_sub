@@ -1,7 +1,6 @@
 import json
 import os
 import requests
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
@@ -15,35 +14,29 @@ MIXING_TANK_TOPIC = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 
 
-def post_mixing_tank(payload):
-    data = {
-        "device_id": "mixing_tank_01",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "temperature": payload["temperature"],
-        "ph": payload["ph"],
-        "level": payload["level"],
-        "dissolved_oxygen": payload["dissolved_oxygen"],
-    }
+def _safe_response_body(r):
     try:
-        r = requests.post(f"{API_BASE_URL}/iot/mixing-tank", json=data)
-        print(f"  [API] {r.status_code} {r.json()}")
-    except requests.RequestException as e:
-        print(f"  [API] Error: {e}")
+        return r.json()
+    except ValueError:
+        return r.text
 
 
-def post_distribution_tank(bed, payload):
+def post_medicion(payload, bed=None):
     data = {
-        "device_id": f"dist_tank_{bed}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "temperature": payload["temperature"],
+        "modulo": payload.get("module"),
+        "tanque": payload.get("tank"),
+        "balsa": bed if bed is not None else payload.get("bed"),
         "ph": payload["ph"],
-        "level": payload["level"],
-        "conductivity": payload["conductivity"],
+        "temperatura": payload["temperature"],
+        "nivel": payload["level"],
+        "od": payload.get("OD", payload.get("dissolved_oxygen", 0)),
+        "ce": payload.get("EC", payload.get("conductivity", 0)),
+        "status": payload.get("status", "ok"),
     }
     try:
-        r = requests.post(f"{API_BASE_URL}/iot/distribution-tank/{bed}", json=data)
-        print(f"  [API] {r.status_code} {r.json()}")
-    except requests.RequestException as e:
+        r = requests.post(f"{API_BASE_URL}/medicion", json=data, timeout=5)
+        print(f"  [API] {r.status_code} {_safe_response_body(r)}")
+    except (requests.RequestException, ValueError) as e:
         print(f"  [API] Error: {e}")
 
 
@@ -52,7 +45,7 @@ def print_mixing_tank(payload):
     print(f"  Temperature      : {payload['temperature']} °C")
     print(f"  PH               : {payload['ph']}")
     print(f"  Level            : {payload['level']} mm")
-    print(f"  Dissolved Oxygen : {payload['dissolved_oxygen']} mg/L")
+    print(f"  Dissolved Oxygen : {payload.get('OD', payload.get('dissolved_oxygen', 0))} mg/L")
 
 
 def print_distribution_tank(bed, payload):
@@ -60,7 +53,7 @@ def print_distribution_tank(bed, payload):
     print(f"  Temperature  : {payload['temperature']} °C")
     print(f"  PH           : {payload['ph']}")
     print(f"  Level        : {payload['level']} mm")
-    print(f"  Conductivity : {payload['conductivity']} µS/cm")
+    print(f"  Conductivity : {payload.get('EC', payload.get('conductivity', 0))} µS/cm")
 
 
 def on_connect(client, userdata, flags, rc):
@@ -84,11 +77,11 @@ def on_message(client, userdata, msg):
 
     if msg.topic == MIXING_TANK_TOPIC:
         print_mixing_tank(payload)
-        post_mixing_tank(payload)
+        post_medicion(payload)
     elif msg.topic.startswith("distribution_tank/"):
         bed = msg.topic.split("/")[1]
         print_distribution_tank(bed, payload)
-        post_distribution_tank(bed, payload)
+        post_medicion(payload, bed=bed)
 
     print()
 
