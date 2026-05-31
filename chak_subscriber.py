@@ -1,7 +1,6 @@
 import json
 import os
 import requests
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
 import paho.mqtt.client as mqtt
@@ -27,43 +26,20 @@ def _safe_response_body(r):
         return r.text
 
 
-def post_mixing_tank(payload):
+def post_medicion(payload, bed=None):
     data = {
-        "device_id": "mixing_tank_01",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "module": payload.get("module"),
-        "tank": payload.get("tank"),
-        "bed": payload.get("bed"),
-        "temperature": payload["temperature"],
+        "modulo": payload.get("module"),
+        "tanque": payload.get("tank"),
+        "balsa": bed if bed is not None else payload.get("bed"),
         "ph": payload["ph"],
-        "level": payload["level"],
-        "dissolved_oxygen": payload["OD"],
-        "conductivity": payload.get("EC", 0),
+        "temperatura": payload["temperature"],
+        "nivel": payload["level"],
+        "od": payload.get("OD", 0),
+        "ce": payload.get("EC", 0),
         "status": payload.get("status", "ok"),
     }
     try:
-        r = requests.post(f"{API_BASE_URL}/iot/mixing-tank", json=data, timeout=5)
-        print(f"  [API] {r.status_code} {_safe_response_body(r)}")
-    except (requests.RequestException, ValueError) as e:
-        print(f"  [API] Error: {e}")
-
-
-def post_distribution_tank(bed, payload):
-    data = {
-        "device_id": f"dist_tank_{bed}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "module": payload.get("module"),
-        "tank": payload.get("tank"),
-        "bed": payload.get("bed", bed),
-        "temperature": payload["temperature"],
-        "ph": payload["ph"],
-        "level": payload["level"],
-        "conductivity": payload["EC"],
-        "dissolved_oxygen": payload.get("OD", 0),
-        "status": payload.get("status", "ok"),
-    }
-    try:
-        r = requests.post(f"{API_BASE_URL}/iot/distribution-tank/{bed}", json=data, timeout=5)
+        r = requests.post(f"{API_BASE_URL}/medicion", json=data, timeout=5)
         print(f"  [API] {r.status_code} {_safe_response_body(r)}")
     except (requests.RequestException, ValueError) as e:
         print(f"  [API] Error: {e}")
@@ -117,11 +93,11 @@ def on_message(client, userdata, msg):
 
     if msg.topic == MIXING_TANK_TOPIC:
         print_mixing_tank(payload)
-        post_mixing_tank(payload)
+        post_medicion(payload)
     elif msg.topic.startswith("distribution_tank/"):
         bed = msg.topic.split("/")[1]
         print_distribution_tank(bed, payload)
-        post_distribution_tank(bed, payload)
+        post_medicion(payload, bed=bed)
 
     print()
 
