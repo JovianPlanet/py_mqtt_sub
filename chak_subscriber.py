@@ -21,11 +21,11 @@ def _safe_response_body(r):
         return r.text
 
 
-def post_medicion(payload, bed=None):
+def post_medicion(payload):
     data = {
-        "modulo": payload.get("module"),
-        "tanque": payload.get("tank"),
-        "balsa": bed if bed is not None else payload.get("bed"),
+        "modulo": str(payload.get("module", "")),
+        "tanque": int(payload.get("tank", 0)),
+        "balsa": int(payload.get("bed", 0)),
         "ph": payload["ph"],
         "temperatura": payload["temperature"],
         "nivel": payload["level"],
@@ -81,7 +81,7 @@ def on_message(client, userdata, msg):
     elif msg.topic.startswith("distribution_tank/"):
         bed = msg.topic.split("/")[1]
         print_distribution_tank(bed, payload)
-        post_medicion(payload, bed=bed)
+        post_medicion(payload)
 
     print()
 
