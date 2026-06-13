@@ -12,6 +12,7 @@ PORT = int(os.getenv("PORT", 1883))
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("HTTP_PORT", 8001))
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_KEY = os.getenv("API_KEY", "")
 
 MIXING_TANK_TOPIC = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
@@ -39,7 +40,12 @@ def post_medicion(payload):
         "status": payload.get("status", "ok"),
     }
     try:
-        r = requests.post(f"{API_BASE_URL}/medicion", json=data, timeout=5)
+        r = requests.post(
+            f"{API_BASE_URL}/medicion",
+            json=data,
+            headers={"X-API-Key": API_KEY},
+            timeout=5,
+        )
         print(f"  [API] {r.status_code} {_safe_response_body(r)}")
     except (requests.RequestException, ValueError) as e:
         print(f"  [API] Error: {e}")
