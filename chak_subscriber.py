@@ -126,32 +126,32 @@ client.loop_start()
 app = Flask(__name__)
 
 
-@app.route("/request", methods=["POST"])
-def handle_request():
+@app.route("/medir", methods=["POST"])
+def handle_medir():
     """Receive a measurement request from the backend and forward it
     to the ESP32 nodes via the MQTT request topic.
 
-    Expected JSON: {"module": <uuid>, "tank": <int>, "bed": <int>}
+    Expected JSON: {"modulo": <uuid>, "tanque": <int>, "balsa": <int>}
     """
     data = flask_request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Body must be a JSON object"}), 400
 
-    missing = [k for k in ("module", "tank", "bed") if k not in data]
+    missing = [k for k in ("modulo", "tanque", "balsa") if k not in data]
     if missing:
         return jsonify({"error": f"Missing fields: {missing}"}), 400
 
     payload = {
-        "module": data["module"],
-        "tank": data["tank"],
-        "bed": data["bed"],
+        "modulo": data["modulo"],
+        "tanque": data["tanque"],
+        "balsa": data["balsa"],
     }
     # QoS 1 = at-least-once, so a transient broker hiccup doesn't drop the request.
     result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
     if result.rc != mqtt.MQTT_ERR_SUCCESS:
         return jsonify({"error": f"MQTT publish failed (rc={result.rc})"}), 502
 
-    print(f"[REQUEST] -> {REQUEST_TOPIC}: {payload}")
+    print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
     return jsonify({"status": "queued", "topic": REQUEST_TOPIC, "payload": payload}), 202
 
 
