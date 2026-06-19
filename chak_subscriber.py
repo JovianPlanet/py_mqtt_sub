@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
@@ -18,6 +19,10 @@ MIXING_TANK_TOPIC = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
 
+# Solicitudes pendientes: tanque (int) -> {modulo, tanque, balsa}
+_pending: dict = {}
+_pending_lock = threading.Lock()
+
 
 def _safe_response_body(r):
     """Return parsed JSON if possible, else the raw text."""
@@ -27,11 +32,12 @@ def _safe_response_body(r):
         return r.text
 
 
-def post_medicion(payload):
+def post_medicion(payload, context=None):
+    ctx = context or {}
     data = {
-        "modulo": str(payload.get("module", "")),
-        "tanque": int(payload.get("tank", 0)),
-        "balsa": int(payload.get("bed", 0)),
+        "modulo": ctx.get("modulo", str(payload.get("module", ""))),
+        "tanque": ctx.get("tanque", int(payload.get("tank", 0))),
+        "balsa":  ctx.get("balsa",  int(payload.get("bed", 0))),
         "ph": payload["ph"],
         "temperatura": payload["temperature"],
         "nivel": payload["level"],
@@ -97,13 +103,32 @@ def on_message(client, userdata, msg):
         print(f"[{msg.topic}] Failed to parse payload: {e}")
         return
 
+    print(f"[MQTT] <- {msg.topic}")
+
     if msg.topic == MIXING_TANK_TOPIC:
-        print_mixing_tank(payload)
-        post_medicion(payload)
+        tank_num = int(payload.get("tank", 0))
+        try:
+            print_mixing_tank(payload)
+        except Exception as e:
+            print(f"  [WARN] print error: {e}")
     elif msg.topic.startswith("distribution_tank/"):
         bed = msg.topic.split("/")[1]
-        print_distribution_tank(bed, payload)
-        post_medicion(payload)
+        tank_num = int(payload.get("tank", 0))
+        try:
+            print_distribution_tank(bed, payload)
+        except Exception as e:
+            print(f"  [WARN] print error: {e}")
+    else:
+        return
+
+    with _pending_lock:
+        context = _pending.pop(tank_num, None)
+
+    if context is not None:
+        print(f"  [-> API] Enviando medicion tanque={tank_num}")
+        post_medicion(payload, context)
+    else:
+        print(f"  [SKIP] Sin solicitud pendiente para tanque={tank_num} | pendientes={list(_pending.keys())}")
 
     print()
 
@@ -141,11 +166,14 @@ def handle_medir():
     if missing:
         return jsonify({"error": f"Missing fields: {missing}"}), 400
 
-    payload = {
-        "modulo": data["modulo"],
-        "tanque": data["tanque"],
-        "balsa": data["balsa"],
-    }
+    tanque = int(data["tanque"])
+    balsa  = int(data["balsa"])
+    context = {"modulo": data["modulo"], "tanque": tanque, "balsa": balsa}
+
+    with _pending_lock:
+        _pending[tanque] = context
+
+    payload = {"modulo": data["modulo"], "tanque": tanque, "balsa": balsa}
     # QoS 1 = at-least-once, so a transient broker hiccup doesn't drop the request.
     result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
     if result.rc != mqtt.MQTT_ERR_SUCCESS:
