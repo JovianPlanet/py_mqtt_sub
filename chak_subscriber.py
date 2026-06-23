@@ -124,11 +124,8 @@ def on_message(client, userdata, msg):
     with _pending_lock:
         context = _pending.pop(tank_num, None)
 
-    if context is not None:
-        print(f"  [-> API] Enviando medicion tanque={tank_num}")
-        post_medicion(payload, context)
-    else:
-        print(f"  [SKIP] Sin solicitud pendiente para tanque={tank_num} | pendientes={list(_pending.keys())}")
+    print(f"  [-> API] Enviando medicion tanque={tank_num}")
+    post_medicion(payload, context)
 
     print()
 
