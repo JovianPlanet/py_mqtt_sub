@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import threading
-from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
@@ -53,50 +52,25 @@ def _safe_response_body(r):
 
 def post_medicion(payload, context=None):
     ctx = context or {}
-    tank      = int(payload.get("tank", ctx.get("tanque", 0)))
-    bed       = int(payload.get("bed",  ctx.get("balsa",  0)))
-    device_id = str(payload.get("module", ctx.get("modulo", "")))
-    timestamp = datetime.now(timezone.utc).isoformat()
-    headers   = {"X-API-Key": API_KEY}
-
-    if tank == 2:
-        endpoint = f"{API_BASE_URL}/iot/mixing_tank"
-        data = {
-            "device_id":        device_id,
-            "timestamp":        timestamp,
-            "module":           device_id,
-            "tank":             tank,
-            "bed":              bed,
-            "temperature":      float(payload["temperature"]),
-            "ph":               float(payload["ph"]),
-            "level":            float(payload["level"]),
-            "dissolved_oxygen": float(payload.get("OD", 0)),
-            "conductivity":     float(payload.get("EC", 0)),
-            "status":           payload.get("status", "ok"),
-        }
-    elif tank == 1:
-        endpoint = f"{API_BASE_URL}/iot/distribution_tank/{bed}"
-        data = {
-            "device_id":        device_id,
-            "timestamp":        timestamp,
-            "module":           device_id,
-            "tank":             tank,
-            "bed":              bed,
-            "temperature":      float(payload["temperature"]),
-            "ph":               float(payload["ph"]),
-            "level":            float(payload["level"]),
-            "conductivity":     float(payload.get("EC", 0)),
-            "dissolved_oxygen": float(payload.get("OD", 0)),
-            "status":           payload.get("status", "ok"),
-        }
-    else:
-        print(f"  [API] Tanque desconocido: {tank}")
-        return
-
+    data = {
+        "modulo":      ctx.get("modulo", str(payload.get("module", ""))),
+        "tanque":      ctx.get("tanque", int(payload.get("tank", 0))),
+        "balsa":       ctx.get("balsa",  int(payload.get("bed", 0))),
+        "ph":          float(payload["ph"]),
+        "temperatura": float(payload["temperature"]),
+        "nivel":       float(payload["level"]),
+        "od":          float(payload.get("OD", 0)),
+        "ce":          float(payload.get("EC", 0)),
+        "status":      payload.get("status", "ok"),
+    }
     try:
-        r = requests.post(endpoint, json=data, headers=headers, timeout=5)
-        print(f"  [API] {r.status_code} → {endpoint}")
-        print(f"  [API] {_safe_response_body(r)}")
+        r = requests.post(
+            f"{API_BASE_URL}/medicion",
+            json=data,
+            headers={"X-API-Key": API_KEY},
+            timeout=5,
+        )
+        print(f"  [API] {r.status_code} {_safe_response_body(r)}")
     except (requests.RequestException, ValueError) as e:
         print(f"  [API] Error: {e}")
 
