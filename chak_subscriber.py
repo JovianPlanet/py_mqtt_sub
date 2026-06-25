@@ -18,10 +18,14 @@ API_KEY = os.getenv("API_KEY", "")
 MIXING_TANK_TOPIC = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
+STATUS_TOPIC = "status/+"
 
 # Solicitudes pendientes: tanque (int) -> {modulo, tanque, balsa}
 _pending: dict = {}
 _pending_lock = threading.Lock()
+
+# Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
+_node_status: dict = {}
 
 
 def _safe_response_body(r):
@@ -88,8 +92,10 @@ def on_connect(client, userdata, flags, rc):
         print("Connected to broker")
         client.subscribe(MIXING_TANK_TOPIC)
         client.subscribe(DISTRIBUTION_TANK_TOPIC)
+        client.subscribe(STATUS_TOPIC)
         print(f"Subscribed to: {MIXING_TANK_TOPIC}")
         print(f"Subscribed to: {DISTRIBUTION_TANK_TOPIC}")
+        print(f"Subscribed to: {STATUS_TOPIC}")
         print(f"Will publish measurement requests to: {REQUEST_TOPIC}")
         print()
     else:
@@ -97,6 +103,12 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
+    if msg.topic.startswith("status/"):
+        estado = msg.payload.decode(errors="replace").strip()
+        _node_status[msg.topic] = estado
+        print(f"[STATUS] {msg.topic} → {estado}")
+        return
+
     try:
         payload = json.loads(msg.payload.decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -178,6 +190,11 @@ def handle_medir():
 
     print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
     return jsonify({"status": "queued", "topic": REQUEST_TOPIC, "payload": payload}), 202
+
+
+@app.route("/status", methods=["GET"])
+def node_status():
+    return jsonify(_node_status), 200
 
 
 @app.route("/health", methods=["GET"])
