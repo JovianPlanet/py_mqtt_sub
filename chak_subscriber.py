@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import threading
@@ -5,6 +6,8 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
 import paho.mqtt.client as mqtt
+
+from a64_client import A64Client
 
 load_dotenv()
 
@@ -15,10 +18,18 @@ HTTP_PORT = int(os.getenv("HTTP_PORT", 8001))
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 API_KEY = os.getenv("API_KEY", "")
 
-MIXING_TANK_TOPIC = "mixing_tank"
+# ── Kincony KC868-A64 ─────────────────────────────────────────────────────────
+A64_HOST          = os.getenv("A64_HOST", "192.168.0.103")
+A64_PORT          = int(os.getenv("A64_PORT", "6053"))
+A64_NOISE_KEY     = os.getenv("A64_NOISE_KEY", "Dw3Z3r2KbL05KstmqaTSWpxvY/6A4WoRcOUKgq6W99Y=")
+A64_EXPECTED_NAME = os.getenv("A64_EXPECTED_NAME", "produccion")
+SUCTION_DURATION_S = int(os.getenv("SUCTION_DURATION_S", str(10 * 60)))
+RETURN_DURATION_S  = int(os.getenv("RETURN_DURATION_S",  str(10 * 60)))
+
+MIXING_TANK_TOPIC    = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
-STATUS_TOPIC = "status/+"
+STATUS_TOPIC  = "status/+"
 
 # Solicitudes pendientes: tanque (int) -> {modulo, tanque, balsa}
 _pending: dict = {}
@@ -27,9 +38,12 @@ _pending_lock = threading.Lock()
 # Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
 _node_status: dict = {}
 
+# Retornos pendientes: tanque (int) -> {"balsa": int}
+_return_pending: dict = {}
+_return_lock = threading.Lock()
+
 
 def _safe_response_body(r):
-    """Return parsed JSON if possible, else the raw text."""
     try:
         return r.json()
     except ValueError:
@@ -39,15 +53,15 @@ def _safe_response_body(r):
 def post_medicion(payload, context=None):
     ctx = context or {}
     data = {
-        "modulo": ctx.get("modulo", str(payload.get("module", ""))),
-        "tanque": ctx.get("tanque", int(payload.get("tank", 0))),
-        "balsa":  ctx.get("balsa",  int(payload.get("bed", 0))),
-        "ph": payload["ph"],
+        "modulo":      ctx.get("modulo", str(payload.get("module", ""))),
+        "tanque":      ctx.get("tanque", int(payload.get("tank", 0))),
+        "balsa":       ctx.get("balsa",  int(payload.get("bed", 0))),
+        "ph":          payload["ph"],
         "temperatura": payload["temperature"],
-        "nivel": payload["level"],
-        "od": payload.get("OD", 0),
-        "ce": payload.get("EC", 0),
-        "status": payload.get("status", "ok"),
+        "nivel":       payload["level"],
+        "od":          payload.get("OD", 0),
+        "ce":          payload.get("EC", 0),
+        "status":      payload.get("status", "ok"),
     }
     try:
         r = requests.post(
@@ -86,6 +100,80 @@ def print_distribution_tank(bed, payload):
     print(f"  Dissolved O2 : {payload.get('OD', 0)} mg/L")
     print(f"  Status       : {payload.get('status', 'ok')}")
 
+
+# ── Kincony A64 sequences ─────────────────────────────────────────────────────
+
+def _a64_client() -> A64Client:
+    return A64Client(
+        host=A64_HOST,
+        port=A64_PORT,
+        noise_psk=A64_NOISE_KEY,
+        expected_name=A64_EXPECTED_NAME,
+    )
+
+
+async def _suction_sequence(balsa: int) -> None:
+    ev_out = f"EV_OUT_BAND_{balsa:02d}"
+    print(f"[A64] Iniciando succion: {ev_out} + A_MB_Succion ({SUCTION_DURATION_S}s)")
+    async with _a64_client() as a64:
+        await a64.turn_on(ev_out)
+        await a64.turn_on("A_MB_Succion ")
+        await asyncio.sleep(SUCTION_DURATION_S)
+        await a64.turn_off("A_MB_Succion ")
+        await a64.turn_off(ev_out)
+    print(f"[A64] Succion finalizada: {ev_out}")
+
+
+async def _return_sequence(balsa: int) -> None:
+    ev_in = f"EV_IN_BAND_{balsa:02d}"
+    print(f"[A64] Iniciando retorno: A_MB200 + {ev_in} ({RETURN_DURATION_S}s)")
+    async with _a64_client() as a64:
+        await a64.turn_on("A_MB200")
+        await a64.turn_on(ev_in)
+        await asyncio.sleep(RETURN_DURATION_S)
+        await a64.turn_off(ev_in)
+        await a64.turn_off("A_MB200")
+    print(f"[A64] Retorno finalizado: {ev_in}")
+
+
+def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
+    """
+    Corre en un thread daemon.
+    1. Activa succion en la A64 durante SUCTION_DURATION_S.
+    2. Publica el request MQTT para que el ESP32 tome la medicion.
+    """
+    try:
+        asyncio.run(_suction_sequence(balsa))
+    except Exception as e:
+        print(f"[A64] Error en succion (balsa={balsa}): {e}")
+        print("[A64] Abortando secuencia: no se enviara request de medicion.")
+        return
+
+    context = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
+    with _pending_lock:
+        _pending[tanque] = context
+    with _return_lock:
+        _return_pending[tanque] = {"balsa": balsa}
+
+    payload = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
+    result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        print(f"[MEDIR] MQTT publish fallido (rc={result.rc})")
+        with _return_lock:
+            _return_pending.pop(tanque, None)
+    else:
+        print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
+
+
+def _start_return_sequence(balsa: int) -> None:
+    """Corre en un thread daemon. Activa retorno en la A64."""
+    try:
+        asyncio.run(_return_sequence(balsa))
+    except Exception as e:
+        print(f"[A64] Error en retorno (balsa={balsa}): {e}")
+
+
+# ── MQTT callbacks ────────────────────────────────────────────────────────────
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -139,15 +227,28 @@ def on_message(client, userdata, msg):
     print(f"  [-> API] Enviando medicion tanque={tank_num}")
     post_medicion(payload, context)
 
+    # Activar retorno si hay una secuencia pendiente para este tanque
+    with _return_lock:
+        return_ctx = _return_pending.pop(tank_num, None)
+
+    if return_ctx:
+        balsa = return_ctx["balsa"]
+        t = threading.Thread(
+            target=_start_return_sequence,
+            args=(balsa,),
+            daemon=True,
+            name=f"retorno-b{balsa:02d}",
+        )
+        t.start()
+
     print()
 
 
-# paho-mqtt ≥ 2.0 deprecated the implicit callback API; pin to V1 if available
-# so the existing on_connect/on_message signatures keep working without warnings.
+# ── MQTT client ───────────────────────────────────────────────────────────────
+
 try:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 except AttributeError:
-    # paho-mqtt 1.x doesn't expose CallbackAPIVersion
     client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
@@ -156,16 +257,23 @@ client.connect(BROKER, PORT)
 client.loop_start()
 
 
-# ─── HTTP API: backend → subscriber → ESP32 ───────────────────────
+# ── HTTP API: backend → subscriber → ESP32 ────────────────────────────────────
 app = Flask(__name__)
 
 
 @app.route("/medir", methods=["POST"])
 def handle_medir():
-    """Receive a measurement request from the backend and forward it
-    to the ESP32 nodes via the MQTT request topic.
+    """
+    Recibe una solicitud de medicion del backend.
 
-    Expected JSON: {"modulo": <uuid>, "tanque": <int>, "balsa": <int>}
+    Inicia en background:
+      1. Activa succion en A64 (EV_OUT_BAND_XX + A_MB_Succion) durante
+         SUCTION_DURATION_S segundos.
+      2. Publica request MQTT al nodo ESP32 correspondiente.
+      3. Al recibir la medicion, activa retorno (A_MB200 + EV_IN_BAND_XX)
+         durante RETURN_DURATION_S segundos.
+
+    JSON esperado: {"modulo": <uuid>, "tanque": <int>, "balsa": <int>}
     """
     data = flask_request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -177,19 +285,23 @@ def handle_medir():
 
     tanque = int(data["tanque"])
     balsa  = int(data["balsa"])
-    context = {"modulo": data["modulo"], "tanque": tanque, "balsa": balsa}
+    modulo = data["modulo"]
 
-    with _pending_lock:
-        _pending[tanque] = context
+    t = threading.Thread(
+        target=_start_medir_sequence,
+        args=(tanque, balsa, modulo),
+        daemon=True,
+        name=f"medir-t{tanque}-b{balsa:02d}",
+    )
+    t.start()
 
-    payload = {"modulo": data["modulo"], "tanque": tanque, "balsa": balsa}
-    # QoS 1 = at-least-once, so a transient broker hiccup doesn't drop the request.
-    result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
-    if result.rc != mqtt.MQTT_ERR_SUCCESS:
-        return jsonify({"error": f"MQTT publish failed (rc={result.rc})"}), 502
-
-    print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
-    return jsonify({"status": "queued", "topic": REQUEST_TOPIC, "payload": payload}), 202
+    print(f"[MEDIR] Secuencia iniciada: tanque={tanque} balsa={balsa}")
+    return jsonify({
+        "status": "queued",
+        "tanque": tanque,
+        "balsa": balsa,
+        "suction_duration_s": SUCTION_DURATION_S,
+    }), 202
 
 
 @app.route("/status", methods=["GET"])

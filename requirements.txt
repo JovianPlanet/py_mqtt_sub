@@ -1,3 +1,5 @@
 paho-mqtt
 requests
 python-dotenv
+flask
+aioesphomeapi>=24.0
