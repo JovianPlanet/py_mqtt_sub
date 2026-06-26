@@ -125,7 +125,7 @@ async def _suction_sequence(balsa: int) -> None:
 
 
 async def _luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int) -> None:
-    entity = f"LUM_BAND_{balsa:02d}"
+    entity = f"LUZ_BAND_{balsa:02d}"
     accion = "encendiendo" if estado else "apagando"
     print(f"[A64] {accion.capitalize()} luminaria: {entity}")
     async with _a64_client() as a64:
