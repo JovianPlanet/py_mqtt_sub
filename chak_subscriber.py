@@ -124,6 +124,29 @@ async def _suction_sequence(balsa: int) -> None:
     print(f"[A64] Succion finalizada: {ev_out}")
 
 
+async def _luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int) -> None:
+    entity = f"LUM_BAND_{balsa:02d}"
+    accion = "encendiendo" if estado else "apagando"
+    print(f"[A64] {accion.capitalize()} luminaria: {entity}")
+    async with _a64_client() as a64:
+        if estado:
+            await a64.turn_on(entity)
+        else:
+            await a64.turn_off(entity)
+    print(f"[A64] Luminaria {entity} {'encendida' if estado else 'apagada'}")
+
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/medicion/luminarias/confirmacion",
+            json={"modulo": modulo, "tanque": tanque, "balsa": balsa, "luminaria": estado},
+            headers={"X-API-Key": API_KEY},
+            timeout=5,
+        )
+        print(f"  [API] Confirmacion luminaria: {r.status_code} {_safe_response_body(r)}")
+    except requests.RequestException as e:
+        print(f"  [API] Error confirmacion luminaria: {e}")
+
+
 async def _return_sequence(balsa: int) -> None:
     ev_in = f"EV_IN_BAND_{balsa:02d}"
     print(f"[A64] Iniciando retorno: A_MB200 + {ev_in} ({RETURN_DURATION_S}s)")
@@ -171,6 +194,14 @@ def _start_return_sequence(balsa: int) -> None:
         asyncio.run(_return_sequence(balsa))
     except Exception as e:
         print(f"[A64] Error en retorno (balsa={balsa}): {e}")
+
+
+def _start_luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int) -> None:
+    """Corre en un thread daemon. Cambia estado de luminaria en la A64 y confirma al backend."""
+    try:
+        asyncio.run(_luminaria_sequence(modulo, tanque, balsa, estado))
+    except Exception as e:
+        print(f"[A64] Error en luminaria (balsa={balsa}): {e}")
 
 
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
@@ -302,6 +333,45 @@ def handle_medir():
         "balsa": balsa,
         "suction_duration_s": SUCTION_DURATION_S,
     }), 202
+
+
+@app.route("/luminarias", methods=["POST"])
+def handle_luminarias():
+    """
+    Recibe comando de cambio de estado de luminaria del backend.
+
+    Responde 200 de inmediato y en background:
+      1. Activa/desactiva el relé LUM_BAND_XX en la A64.
+      2. Confirma el estado real al backend via POST /medicion/luminarias/confirmacion.
+
+    JSON esperado: {"modulo": <uuid>, "tanque": <int>, "balsa": <int>, "estado": 0|1}
+    """
+    data = flask_request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be a JSON object"}), 400
+
+    missing = [k for k in ("modulo", "tanque", "balsa", "estado") if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    modulo = data["modulo"]
+    tanque = int(data["tanque"])
+    balsa  = int(data["balsa"])
+    estado = int(data["estado"])
+
+    if estado not in (0, 1):
+        return jsonify({"error": "estado must be 0 or 1"}), 400
+
+    t = threading.Thread(
+        target=_start_luminaria_sequence,
+        args=(modulo, tanque, balsa, estado),
+        daemon=True,
+        name=f"luminaria-b{balsa:02d}",
+    )
+    t.start()
+
+    print(f"[LUMINARIA] Comando recibido: balsa={balsa} estado={estado}")
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/status", methods=["GET"])
