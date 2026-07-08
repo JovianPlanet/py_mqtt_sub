@@ -25,6 +25,7 @@ A64_NOISE_KEY     = os.getenv("A64_NOISE_KEY", "Dw3Z3r2KbL05KstmqaTSWpxvY/6A4WoR
 A64_EXPECTED_NAME = os.getenv("A64_EXPECTED_NAME", "produccion")
 SUCTION_DURATION_S = int(os.getenv("SUCTION_DURATION_S", str(10 * 60)))
 RETURN_DURATION_S  = int(os.getenv("RETURN_DURATION_S",  str(10 * 60)))
+SKIP_A64           = os.getenv("SKIP_A64", "false").lower() == "true"
 
 MIXING_TANK_TOPIC    = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
@@ -165,12 +166,15 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
     1. Activa succion en la A64 durante SUCTION_DURATION_S.
     2. Publica el request MQTT para que el ESP32 tome la medicion.
     """
-    try:
-        asyncio.run(_suction_sequence(balsa))
-    except Exception as e:
-        print(f"[A64] Error en succion (balsa={balsa}): {e}")
-        print("[A64] Abortando secuencia: no se enviara request de medicion.")
-        return
+    if SKIP_A64:
+        print("[A64] SKIP_A64=true — omitiendo succion.")
+    else:
+        try:
+            asyncio.run(_suction_sequence(balsa))
+        except Exception as e:
+            print(f"[A64] Error en succion (balsa={balsa}): {e}")
+            print("[A64] Abortando secuencia: no se enviara request de medicion.")
+            return
 
     context = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
     with _pending_lock:
@@ -262,7 +266,7 @@ def on_message(client, userdata, msg):
     with _return_lock:
         return_ctx = _return_pending.pop(tank_num, None)
 
-    if return_ctx:
+    if return_ctx and not SKIP_A64:
         balsa = return_ctx["balsa"]
         t = threading.Thread(
             target=_start_return_sequence,
