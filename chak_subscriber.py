@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import threading
 import requests
 from dotenv import load_dotenv
@@ -35,7 +36,8 @@ TANKMIX_EXPECTED_NAME = os.getenv("TANKMIX_EXPECTED_NAME", "tank-mix")
 T_SUCCION      = int(os.getenv("T_SUCCION",      str(10 * 60)))
 T_MB200        = int(os.getenv("T_MB200",        str(10 * 60)))
 T_MBMIX        = int(os.getenv("T_MBMIX",        str(10 * 60)))
-T_H2O_IN       = int(os.getenv("T_H2O_IN",       300))
+T_FILL_POLL_S  = int(os.getenv("T_FILL_POLL_S",  30))   # intervalo entre sondeos de nivel (s)
+T_FILL_MAX_S   = int(os.getenv("T_FILL_MAX_S",   3600)) # timeout de seguridad máximo (s)
 T_OZ           = int(os.getenv("T_OZ",           300))
 T_DOSIFICACION = int(os.getenv("T_DOSIFICACION",  51))
 
@@ -54,6 +56,14 @@ _active_lock = threading.Lock()
 
 # Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
 _node_status: dict = {}
+
+# Último nivel conocido del tanque mix — actualizado en on_message
+_last_mix_level: float = 0.0
+_last_mix_level_lock = threading.Lock()
+# Señal que se activa cada vez que llega un mensaje de mixing_tank
+_mix_level_event = threading.Event()
+# Controla el loop activo de llenado; limpiar para abortar
+_fill_active = threading.Event()
 
 
 def _safe_response_body(r):
@@ -227,16 +237,16 @@ async def _agitador_sequence(tanque: int, estado: bool) -> None:
         print(f"[AGITADOR] Agitador (tank-mix) {'encendido' if estado else 'apagado'}")
 
 
-async def _entrada_agua_sequence(estado: bool) -> None:
-    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} Entrada EPM")
+async def _open_epm() -> None:
     async with _tankmix_client() as tmix:
-        if estado:
-            await tmix.turn_on("Entrada EPM")
-            await asyncio.sleep(T_H2O_IN)
-            await tmix.turn_off("Entrada EPM")
-        else:
-            await tmix.turn_off("Entrada EPM")
-    print(f"[TANKMIX] Entrada EPM {'completada' if estado else 'apagada'}")
+        await tmix.turn_on("Entrada EPM")
+    print("[TANKMIX] Entrada EPM abierta")
+
+
+async def _close_epm() -> None:
+    async with _tankmix_client() as tmix:
+        await tmix.turn_off("Entrada EPM")
+    print("[TANKMIX] Entrada EPM cerrada")
 
 
 async def _ozono_sequence(estado: bool) -> None:
@@ -337,11 +347,73 @@ def _start_agitador_sequence(tanque: int, estado: bool) -> None:
         print(f"[AGITADOR] Error en agitador (tanque={tanque}): {e}")
 
 
-def _start_entrada_agua_sequence(estado: bool) -> None:
+def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> None:
+    """
+    Corre en un thread daemon.
+    estado=False: cierra Entrada EPM inmediatamente y aborta cualquier llenado activo.
+    estado=True:  abre Entrada EPM y monitorea el nivel del tanque mix via MQTT.
+                  Cierra la válvula cuando nivel >= volumen o al cumplirse T_FILL_MAX_S.
+    """
+    if not estado:
+        _fill_active.clear()
+        try:
+            asyncio.run(_close_epm())
+        except Exception as e:
+            print(f"[TANKMIX] Error cerrando Entrada EPM: {e}")
+        return
+
     try:
-        asyncio.run(_entrada_agua_sequence(estado))
+        asyncio.run(_open_epm())
     except Exception as e:
-        print(f"[TANKMIX] Error en entrada de agua: {e}")
+        print(f"[TANKMIX] Error abriendo Entrada EPM: {e}")
+        return
+
+    _fill_active.set()
+    print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
+
+    t_inicio = time.time()
+    alcanzado = False
+
+    while _fill_active.is_set() and (time.time() - t_inicio) < T_FILL_MAX_S:
+        # Solicitar medición al ESP32 del tanque mix
+        _mix_level_event.clear()
+        req = {"modulo": modulo, "tanque": 2, "balsa": 0}
+        result = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f"[ENTRADA_AGUA] MQTT publish fallido (rc={result.rc}). Reintentando en {T_FILL_POLL_S}s")
+            time.sleep(T_FILL_POLL_S)
+            continue
+
+        # Esperar respuesta del ESP32 (máx 60 s)
+        got = _mix_level_event.wait(timeout=60)
+        if not got:
+            print("[ENTRADA_AGUA] Sin respuesta del ESP32 en 60 s. Reintentando...")
+            continue
+
+        with _last_mix_level_lock:
+            nivel_actual = _last_mix_level
+
+        elapsed = int(time.time() - t_inicio)
+        print(f"[ENTRADA_AGUA] Nivel: {nivel_actual:.2f} L / objetivo: {volumen} L (t={elapsed}s)")
+
+        if nivel_actual >= volumen:
+            alcanzado = True
+            _fill_active.clear()
+            break
+
+        # Esperar el intervalo configurado antes del próximo sondeo
+        time.sleep(T_FILL_POLL_S)
+
+    motivo = "Volumen alcanzado" if alcanzado else \
+             "Detenido externamente" if not _fill_active.is_set() else \
+             f"Timeout de seguridad ({T_FILL_MAX_S}s)"
+    print(f"[ENTRADA_AGUA] {motivo}. Cerrando Entrada EPM.")
+    _fill_active.clear()
+
+    try:
+        asyncio.run(_close_epm())
+    except Exception as e:
+        print(f"[TANKMIX] Error cerrando Entrada EPM: {e}")
 
 
 def _start_ozono_sequence(estado: bool) -> None:
@@ -392,6 +464,9 @@ def on_message(client, userdata, msg):
 
     if msg.topic == MIXING_TANK_TOPIC:
         tank_num = int(payload.get("tank", 0))
+        with _last_mix_level_lock:
+            _last_mix_level = float(payload.get("level", 0.0))
+        _mix_level_event.set()
         try:
             print_mixing_tank(payload)
         except Exception as e:
@@ -669,37 +744,47 @@ def handle_bombas():
 @app.route("/entrada_agua", methods=["POST"])
 def handle_entrada_agua():
     """
-    Abre la entrada de agua de red al tanque mix (Entrada EPM) durante T_H2O_IN s.
+    Controla la entrada de agua de red al tanque mix (Entrada EPM).
 
-    JSON esperado: {"modulo": <uuid>, "estado": true|false}
+    JSON esperado: {"modulo": <uuid>, "volumen": <int>, "estado": true|false}
 
-    estado=true:  activa Entrada EPM durante T_H2O_IN s y luego la desactiva.
-    estado=false: desactiva Entrada EPM inmediatamente.
+    estado=true:  abre Entrada EPM y monitorea el nivel del tanque mix vía MQTT.
+                  Cierra la válvula automáticamente cuando nivel >= volumen (L).
+                  Timeout de seguridad: T_FILL_MAX_S segundos.
+    estado=false: cierra Entrada EPM inmediatamente y aborta el llenado activo.
     """
     data = flask_request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Body must be a JSON object"}), 400
 
-    missing = [k for k in ("modulo", "estado") if k not in data]
+    missing = [k for k in ("modulo", "volumen", "estado") if k not in data]
     if missing:
         return jsonify({"error": f"Missing fields: {missing}"}), 400
 
-    estado = bool(data["estado"])
+    modulo = str(data["modulo"])
+    volumen = int(data["volumen"])
+    estado  = bool(data["estado"])
+
+    if estado and volumen <= 0:
+        return jsonify({"error": "volumen must be > 0"}), 422
 
     t = threading.Thread(
         target=_start_entrada_agua_sequence,
-        args=(estado,),
+        args=(modulo, volumen, estado),
         daemon=True,
         name=f"entrada-agua-{'on' if estado else 'off'}",
     )
     t.start()
 
-    print(f"[ENTRADA_AGUA] Comando recibido: estado={estado}")
-    return jsonify({
-        "status": "queued",
-        "estado": estado,
-        "duracion_s": T_H2O_IN if estado else 0,
-    }), 202
+    print(f"[ENTRADA_AGUA] Comando recibido: estado={estado} volumen={volumen} L")
+    if estado:
+        return jsonify({
+            "status": "queued",
+            "volumen_objetivo_L": volumen,
+            "poll_interval_s": T_FILL_POLL_S,
+            "timeout_max_s": T_FILL_MAX_S,
+        }), 202
+    return jsonify({"status": "ok", "accion": "Entrada EPM cerrada"}), 200
 
 
 @app.route("/ozono", methods=["POST"])
