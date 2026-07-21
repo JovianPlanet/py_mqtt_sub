@@ -36,3 +36,6 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Manuales
+logica-proceso-riego.md
