@@ -32,9 +32,12 @@ TANKMIX_NOISE_KEY     = os.getenv("TANKMIX_NOISE_KEY", "ojkGTpvfiDJwONH69xSDFDIm
 TANKMIX_EXPECTED_NAME = os.getenv("TANKMIX_EXPECTED_NAME", "tank-mix")
 
 # ── Tiempos configurables (segundos) ─────────────────────────────────────────
-T_SUCCION = int(os.getenv("T_SUCCION", str(10 * 60)))
-T_MB200   = int(os.getenv("T_MB200",   str(10 * 60)))
-T_MBMIX   = int(os.getenv("T_MBMIX",   str(10 * 60)))
+T_SUCCION      = int(os.getenv("T_SUCCION",      str(10 * 60)))
+T_MB200        = int(os.getenv("T_MB200",        str(10 * 60)))
+T_MBMIX        = int(os.getenv("T_MBMIX",        str(10 * 60)))
+T_H2O_IN       = int(os.getenv("T_H2O_IN",       300))
+T_OZ           = int(os.getenv("T_OZ",           300))
+T_DOSIFICACION = int(os.getenv("T_DOSIFICACION",  51))
 
 MIXING_TANK_TOPIC       = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
@@ -205,14 +208,60 @@ async def _luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int)
         print(f"  [API] Error confirmacion luminaria: {e}")
 
 
-async def _bombas_sequence(estado: bool) -> None:
-    print(f"[TANKMIX] {'Encendiendo' if estado else 'Apagando'} Agitador")
+async def _agitador_sequence(tanque: int, estado: bool) -> None:
+    if tanque == 1:
+        print(f"[A64] {'Encendiendo' if estado else 'Apagando'} agitador dist: A_AG200")
+        async with _a64_client() as a64:
+            if estado:
+                await a64.turn_on("A_AG200")
+            else:
+                await a64.turn_off("A_AG200")
+        print(f"[AGITADOR] A_AG200 (a64_prod) {'encendido' if estado else 'apagado'}")
+    else:
+        print(f"[TANKMIX] {'Encendiendo' if estado else 'Apagando'} agitador mix: Agitador")
+        async with _tankmix_client() as tmix:
+            if estado:
+                await tmix.turn_on("Agitador")
+            else:
+                await tmix.turn_off("Agitador")
+        print(f"[AGITADOR] Agitador (tank-mix) {'encendido' if estado else 'apagado'}")
+
+
+async def _entrada_agua_sequence(estado: bool) -> None:
+    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} Entrada EPM")
     async with _tankmix_client() as tmix:
         if estado:
-            await tmix.turn_on("Agitador")
+            await tmix.turn_on("Entrada EPM")
+            await asyncio.sleep(T_H2O_IN)
+            await tmix.turn_off("Entrada EPM")
         else:
-            await tmix.turn_off("Agitador")
-    print(f"[TANKMIX] Agitador {'encendido' if estado else 'apagado'}")
+            await tmix.turn_off("Entrada EPM")
+    print(f"[TANKMIX] Entrada EPM {'completada' if estado else 'apagada'}")
+
+
+async def _ozono_sequence(estado: bool) -> None:
+    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} Ozono")
+    async with _tankmix_client() as tmix:
+        if estado:
+            await tmix.turn_on("Ozono")
+            await asyncio.sleep(T_OZ)
+            await tmix.turn_off("Ozono")
+        else:
+            await tmix.turn_off("Ozono")
+    print(f"[TANKMIX] Ozono {'completado' if estado else 'apagado'}")
+
+
+async def _peris_sequence(peris: int, estado: bool) -> None:
+    name = f"Peris_{peris}"
+    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} {name}")
+    async with _tankmix_client() as tmix:
+        if estado:
+            await tmix.turn_on(name)
+            await asyncio.sleep(T_DOSIFICACION)
+            await tmix.turn_off(name)
+        else:
+            await tmix.turn_off(name)
+    print(f"[TANKMIX] {name} {'completado' if estado else 'apagado'}")
 
 
 # ── Thread starters ───────────────────────────────────────────────────────────
@@ -281,11 +330,32 @@ def _start_luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int)
         print(f"[A64] Error en luminaria (balsa={balsa}): {e}")
 
 
-def _start_bombas_sequence(estado: bool) -> None:
+def _start_agitador_sequence(tanque: int, estado: bool) -> None:
     try:
-        asyncio.run(_bombas_sequence(estado))
+        asyncio.run(_agitador_sequence(tanque, estado))
     except Exception as e:
-        print(f"[TANKMIX] Error en agitador: {e}")
+        print(f"[AGITADOR] Error en agitador (tanque={tanque}): {e}")
+
+
+def _start_entrada_agua_sequence(estado: bool) -> None:
+    try:
+        asyncio.run(_entrada_agua_sequence(estado))
+    except Exception as e:
+        print(f"[TANKMIX] Error en entrada de agua: {e}")
+
+
+def _start_ozono_sequence(estado: bool) -> None:
+    try:
+        asyncio.run(_ozono_sequence(estado))
+    except Exception as e:
+        print(f"[TANKMIX] Error en ozono: {e}")
+
+
+def _start_peris_sequence(peris: int, estado: bool) -> None:
+    try:
+        asyncio.run(_peris_sequence(peris, estado))
+    except Exception as e:
+        print(f"[TANKMIX] Error en peristáltica Peris_{peris}: {e}")
 
 
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
@@ -531,10 +601,46 @@ def handle_luminarias():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/agitador", methods=["POST"])
+def handle_agitador():
+    """
+    Enciende o apaga el agitador del tanque indicado.
+
+    JSON esperado: {"modulo": <uuid>, "tanque": 1|2, "estado": true|false}
+
+    tanque=1: A_AG200 en placa a64_prod (tanque de distribución).
+    tanque=2: Agitador en placa tank-mix.
+    """
+    data = flask_request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be a JSON object"}), 400
+
+    missing = [k for k in ("modulo", "tanque", "estado") if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    tanque = int(data["tanque"])
+    estado = bool(data["estado"])
+
+    if tanque not in (1, 2):
+        return jsonify({"error": "tanque must be 1 or 2"}), 422
+
+    t = threading.Thread(
+        target=_start_agitador_sequence,
+        args=(tanque, estado),
+        daemon=True,
+        name=f"agitador-t{tanque}-{'on' if estado else 'off'}",
+    )
+    t.start()
+
+    print(f"[AGITADOR] Comando recibido: tanque={tanque} estado={estado}")
+    return jsonify({"status": "ok", "tanque": tanque, "estado_aplicado": estado}), 200
+
+
 @app.route("/bombas", methods=["POST"])
 def handle_bombas():
     """
-    Enciende o apaga el agitador del tanque mix (placa tank-mix).
+    Alias de /agitador para tanque=2 (backward-compat con el broker). Prefiere /agitador.
 
     JSON esperado: {"modulo": <uuid>, "estado": true|false}
     """
@@ -549,8 +655,8 @@ def handle_bombas():
     estado = bool(data["estado"])
 
     t = threading.Thread(
-        target=_start_bombas_sequence,
-        args=(estado,),
+        target=_start_agitador_sequence,
+        args=(2, estado),
         daemon=True,
         name=f"bombas-{'on' if estado else 'off'}",
     )
@@ -558,6 +664,119 @@ def handle_bombas():
 
     print(f"[BOMBAS] Comando recibido: estado={estado}")
     return jsonify({"status": "ok", "estado_aplicado": estado}), 200
+
+
+@app.route("/entrada_agua", methods=["POST"])
+def handle_entrada_agua():
+    """
+    Abre la entrada de agua de red al tanque mix (Entrada EPM) durante T_H2O_IN s.
+
+    JSON esperado: {"modulo": <uuid>, "estado": true|false}
+
+    estado=true:  activa Entrada EPM durante T_H2O_IN s y luego la desactiva.
+    estado=false: desactiva Entrada EPM inmediatamente.
+    """
+    data = flask_request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be a JSON object"}), 400
+
+    missing = [k for k in ("modulo", "estado") if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    estado = bool(data["estado"])
+
+    t = threading.Thread(
+        target=_start_entrada_agua_sequence,
+        args=(estado,),
+        daemon=True,
+        name=f"entrada-agua-{'on' if estado else 'off'}",
+    )
+    t.start()
+
+    print(f"[ENTRADA_AGUA] Comando recibido: estado={estado}")
+    return jsonify({
+        "status": "queued",
+        "estado": estado,
+        "duracion_s": T_H2O_IN if estado else 0,
+    }), 202
+
+
+@app.route("/ozono", methods=["POST"])
+def handle_ozono():
+    """
+    Activa el generador de ozono del tanque mix durante T_OZ s.
+
+    JSON esperado: {"modulo": <uuid>, "estado": true|false}
+
+    estado=true:  activa Ozono durante T_OZ s y luego lo desactiva.
+    estado=false: desactiva Ozono inmediatamente.
+    """
+    data = flask_request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be a JSON object"}), 400
+
+    missing = [k for k in ("modulo", "estado") if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    estado = bool(data["estado"])
+
+    t = threading.Thread(
+        target=_start_ozono_sequence,
+        args=(estado,),
+        daemon=True,
+        name=f"ozono-{'on' if estado else 'off'}",
+    )
+    t.start()
+
+    print(f"[OZONO] Comando recibido: estado={estado}")
+    return jsonify({
+        "status": "queued",
+        "estado": estado,
+        "duracion_s": T_OZ if estado else 0,
+    }), 202
+
+
+@app.route("/peris", methods=["POST"])
+def handle_peris():
+    """
+    Activa una bomba peristáltica del tanque mix durante T_DOSIFICACION s.
+
+    JSON esperado: {"modulo": <uuid>, "peris": 1|2|3|4, "estado": true|false}
+
+    estado=true:  activa Peris_N durante T_DOSIFICACION s y luego la desactiva.
+    estado=false: desactiva Peris_N inmediatamente.
+    """
+    data = flask_request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be a JSON object"}), 400
+
+    missing = [k for k in ("modulo", "peris", "estado") if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    peris  = int(data["peris"])
+    estado = bool(data["estado"])
+
+    if peris not in (1, 2, 3, 4):
+        return jsonify({"error": "peris must be 1, 2, 3 or 4"}), 422
+
+    t = threading.Thread(
+        target=_start_peris_sequence,
+        args=(peris, estado),
+        daemon=True,
+        name=f"peris-{peris}-{'on' if estado else 'off'}",
+    )
+    t.start()
+
+    print(f"[PERIS] Comando recibido: peris={peris} estado={estado}")
+    return jsonify({
+        "status": "queued",
+        "peris": peris,
+        "estado": estado,
+        "duracion_s": T_DOSIFICACION if estado else 0,
+    }), 202
 
 
 @app.route("/status", methods=["GET"])
