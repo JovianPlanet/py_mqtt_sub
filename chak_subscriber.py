@@ -576,10 +576,6 @@ def handle_medir():
     if tanque not in (1, 2):
         return jsonify({"error": "tanque must be 1 or 2"}), 422
 
-    node_key = f"status/tank_{tanque}"
-    if _node_status.get(node_key) == "offline":
-        return jsonify({"error": f"Nodo tank_{tanque} está offline. Espera a que el ESP32 reconecte."}), 503
-
     if tanque == 2 and _fill_active.is_set():
         return jsonify({"error": "Llenado activo en tanque mix. Detén /entrada_agua primero."}), 409
 
