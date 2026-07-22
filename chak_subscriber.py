@@ -67,6 +67,9 @@ _mix_level_event = threading.Event()
 # Controla el loop activo de llenado; limpiar para abortar
 _fill_active = threading.Event()
 
+# Señal de conexión MQTT — se activa en on_connect, se limpia en on_disconnect
+_mqtt_connected = threading.Event()
+
 
 def _safe_response_body(r):
     try:
@@ -299,6 +302,13 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
                     _active_sequence_times.pop(tanque, None)
                 return
 
+        if not _mqtt_connected.wait(timeout=10):
+            print(f"[MEDIR] Sin conexión MQTT tras 10 s. Abortando tanque={tanque}.")
+            with _active_lock:
+                _active_sequences.discard(tanque)
+                _active_sequence_times.pop(tanque, None)
+            return
+
         context = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
         with _pending_lock:
             _pending[tanque] = context
@@ -380,6 +390,12 @@ def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> Non
     alcanzado = False
 
     while _fill_active.is_set() and (time.time() - t_inicio) < T_FILL_MAX_S:
+        # Esperar conexión MQTT antes de sondear
+        if not _mqtt_connected.wait(timeout=30):
+            print("[ENTRADA_AGUA] Sin conexión MQTT. Reintentando en 30 s...")
+            time.sleep(T_FILL_POLL_S)
+            continue
+
         # Solicitar medición al ESP32 del tanque mix
         _mix_level_event.clear()
         req = {"modulo": modulo, "tanque": 2, "balsa": 0}
@@ -439,6 +455,7 @@ def _start_peris_sequence(peris: int, estado: bool) -> None:
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
+        _mqtt_connected.set()
         print("Connected to broker")
         client.subscribe(MIXING_TANK_TOPIC)
         client.subscribe(DISTRIBUTION_TANK_TOPIC)
@@ -449,7 +466,16 @@ def on_connect(client, userdata, flags, rc):
         print(f"Will publish measurement requests to: {REQUEST_TOPIC}")
         print()
     else:
+        _mqtt_connected.clear()
         print(f"Connection failed with code {rc}")
+
+
+def on_disconnect(client, userdata, rc):
+    _mqtt_connected.clear()
+    if rc == 0:
+        print("[MQTT] Desconectado del broker correctamente.")
+    else:
+        print(f"[MQTT] Desconexión inesperada del broker (rc={rc}). Reconectando...")
 
 
 def on_message(client, userdata, msg):
@@ -510,7 +536,9 @@ try:
 except AttributeError:
     client = mqtt.Client()
 client.on_connect = on_connect
+client.on_disconnect = on_disconnect
 client.on_message = on_message
+client.reconnect_delay_set(min_delay=2, max_delay=30)
 
 client.connect(BROKER, PORT)
 client.loop_start()
