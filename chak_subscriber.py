@@ -52,7 +52,9 @@ _pending_lock = threading.Lock()
 
 # Mediciones activas: tanque (int) — previene doble disparo de /medir
 _active_sequences: set = set()
+_active_sequence_times: dict = {}          # tanque -> time.time() al añadir
 _active_lock = threading.Lock()
+ACTIVE_SEQUENCE_TIMEOUT_S = 15 * 60       # 15 min: margen sobre T_SUCCION (10 min)
 
 # Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
 _node_status: dict = {}
@@ -294,6 +296,7 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
                 print("[A64] Abortando secuencia: no se enviara request de medicion.")
                 with _active_lock:
                     _active_sequences.discard(tanque)
+                    _active_sequence_times.pop(tanque, None)
                 return
 
         context = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
@@ -308,12 +311,14 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
                 _pending.pop(tanque, None)
             with _active_lock:
                 _active_sequences.discard(tanque)
+                _active_sequence_times.pop(tanque, None)
         else:
             print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
     except Exception as e:
         print(f"[MEDIR] Error inesperado en secuencia (tanque={tanque}): {e}")
         with _active_lock:
             _active_sequences.discard(tanque)
+            _active_sequence_times.pop(tanque, None)
 
 
 def _start_transferir_sequence(tanque: int) -> None:
@@ -485,11 +490,17 @@ def on_message(client, userdata, msg):
         context = _pending.pop(tank_num, None)
 
     with _active_lock:
-        _active_sequences.discard(tank_num)
+        # Solo liberar si había una medición activa (no para lecturas del loop de llenado)
+        if context is not None:
+            _active_sequences.discard(tank_num)
+            _active_sequence_times.pop(tank_num, None)
 
-    print(f"  [-> API] Enviando medicion tanque={tank_num}")
-    post_medicion(payload, context)
-    print()
+    if context is not None:
+        print(f"  [-> API] Enviando medicion tanque={tank_num}")
+        post_medicion(payload, context)
+        print()
+    else:
+        print(f"  [MQTT] Nivel registrado (sondeo de llenado, sin medicion pendiente)")
 
 
 # ── MQTT client ───────────────────────────────────────────────────────────────
@@ -537,10 +548,19 @@ def handle_medir():
     if tanque not in (1, 2):
         return jsonify({"error": "tanque must be 1 or 2"}), 422
 
+    if tanque == 2 and _fill_active.is_set():
+        return jsonify({"error": "Llenado activo en tanque mix. Detén /entrada_agua primero."}), 409
+
     with _active_lock:
         if tanque in _active_sequences:
-            return jsonify({"error": f"Secuencia ya activa para tanque={tanque}"}), 409
+            added_at = _active_sequence_times.get(tanque, 0)
+            if (time.time() - added_at) < ACTIVE_SEQUENCE_TIMEOUT_S:
+                return jsonify({"error": f"Secuencia ya activa para tanque={tanque}"}), 409
+            print(f"[MEDIR] Auto-limpiando secuencia bloqueada para tanque={tanque} (sin respuesta tras {ACTIVE_SEQUENCE_TIMEOUT_S}s)")
+            _active_sequences.discard(tanque)
+            _active_sequence_times.pop(tanque, None)
         _active_sequences.add(tanque)
+        _active_sequence_times[tanque] = time.time()
 
     t = threading.Thread(
         target=_start_medir_sequence,
@@ -767,6 +787,9 @@ def handle_entrada_agua():
 
     if estado and volumen <= 0:
         return jsonify({"error": "volumen must be > 0"}), 422
+
+    if estado and _fill_active.is_set():
+        return jsonify({"error": "Ya hay un llenado activo. Envía estado=false para detenerlo primero."}), 409
 
     t = threading.Thread(
         target=_start_entrada_agua_sequence,
