@@ -915,6 +915,55 @@ def handle_peris():
     }), 202
 
 
+@app.route("/abortar", methods=["POST"])
+def handle_abortar():
+    """
+    Libera manualmente secuencias bloqueadas para evitar el error 409.
+
+    JSON esperado: {"tanque": 1|2}  (opcional — sin campo limpia todos los tanques)
+
+    Limpia _active_sequences y _pending para el tanque indicado.
+    Si tanque=2 o no se especifica, también aborta el loop de llenado activo.
+    """
+    data = flask_request.get_json(silent=True) or {}
+
+    tanque = data.get("tanque")
+    fill_abortado = False
+    tanques_liberados = []
+
+    if tanque is not None:
+        tanque = int(tanque)
+        if tanque not in (1, 2):
+            return jsonify({"error": "tanque must be 1 or 2"}), 422
+        with _active_lock:
+            if tanque in _active_sequences:
+                _active_sequences.discard(tanque)
+                _active_sequence_times.pop(tanque, None)
+                tanques_liberados.append(tanque)
+        with _pending_lock:
+            _pending.pop(tanque, None)
+        if tanque == 2 and _fill_active.is_set():
+            _fill_active.clear()
+            fill_abortado = True
+    else:
+        with _active_lock:
+            tanques_liberados = list(_active_sequences)
+            _active_sequences.clear()
+            _active_sequence_times.clear()
+        with _pending_lock:
+            _pending.clear()
+        if _fill_active.is_set():
+            _fill_active.clear()
+            fill_abortado = True
+
+    print(f"[ABORTAR] Tanques liberados: {tanques_liberados} | fill_abortado: {fill_abortado}")
+    return jsonify({
+        "status": "ok",
+        "tanques_liberados": tanques_liberados,
+        "fill_abortado": fill_abortado,
+    }), 200
+
+
 @app.route("/status", methods=["GET"])
 def node_status():
     return jsonify(_node_status), 200
