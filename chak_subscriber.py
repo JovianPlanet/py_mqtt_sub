@@ -997,6 +997,23 @@ def health():
     return jsonify({"status": "ok", "broker": BROKER, "port": PORT}), 200
 
 
+@app.route("/test_mqtt", methods=["GET"])
+def test_mqtt():
+    """Diagnóstico: publica un mensaje de prueba y verifica si el broker lo confirma."""
+    result = client.publish("test/subscriber_ping", "ping", qos=1)
+    try:
+        result.wait_for_publish(timeout=5)
+    except Exception:
+        pass
+    return jsonify({
+        "mqtt_connected_flag": _mqtt_connected.is_set(),
+        "rc": result.rc,
+        "puback_confirmado": result.is_published(),
+        "broker": BROKER,
+        "port": PORT,
+    }), 200
+
+
 if __name__ == "__main__":
     try:
         app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False)
