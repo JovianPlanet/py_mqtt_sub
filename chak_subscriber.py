@@ -322,8 +322,23 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
             with _active_lock:
                 _active_sequences.discard(tanque)
                 _active_sequence_times.pop(tanque, None)
-        else:
-            print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
+            return
+
+        # Esperar PUBACK del broker (confirma entrega real, no solo encole)
+        try:
+            result.wait_for_publish(timeout=10)
+        except Exception:
+            pass
+        if not result.is_published():
+            print(f"[MEDIR] Broker no confirmó entrega (sin PUBACK en 10 s). Abortando.")
+            with _pending_lock:
+                _pending.pop(tanque, None)
+            with _active_lock:
+                _active_sequences.discard(tanque)
+                _active_sequence_times.pop(tanque, None)
+            return
+
+        print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
     except Exception as e:
         print(f"[MEDIR] Error inesperado en secuencia (tanque={tanque}): {e}")
         with _active_lock:
@@ -402,6 +417,14 @@ def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> Non
         result = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
             print(f"[ENTRADA_AGUA] MQTT publish fallido (rc={result.rc}). Reintentando en {T_FILL_POLL_S}s")
+            time.sleep(T_FILL_POLL_S)
+            continue
+        try:
+            result.wait_for_publish(timeout=10)
+        except Exception:
+            pass
+        if not result.is_published():
+            print(f"[ENTRADA_AGUA] Broker no confirmó entrega. Reintentando en {T_FILL_POLL_S}s")
             time.sleep(T_FILL_POLL_S)
             continue
 
