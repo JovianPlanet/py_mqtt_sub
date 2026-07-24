@@ -56,6 +56,15 @@ _active_sequence_times: dict = {}          # tanque -> time.time() al añadir
 _active_lock = threading.Lock()
 ACTIVE_SEQUENCE_TIMEOUT_S = 15 * 60       # 15 min: margen sobre T_SUCCION (10 min)
 
+# Reintentos de publicación MQTT en _start_medir_sequence
+_PUBLISH_RETRY_MAX     = 3
+_PUBLISH_RETRY_DELAY_S = 5
+
+# Watchdog: re-publica requests sin respuesta del ESP32
+WATCHDOG_INTERVAL_S    = 60   # frecuencia de escaneo (s)
+WATCHDOG_RETRY_AFTER_S = 90   # tiempo sin respuesta antes de re-publicar (s)
+WATCHDOG_MAX_RETRIES   = 3    # máximo de re-publicaciones por request
+
 # Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
 _node_status: dict = {}
 
@@ -289,6 +298,11 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
     tanque=2: publica request MQTT directamente, sin actuacion previa.
     Al recibir la medicion del ESP32, on_message llama a post_medicion y libera
     _active_sequences.
+
+    Si el PUBACK falla (broker inalcanzable), reintenta _PUBLISH_RETRY_MAX veces
+    con _PUBLISH_RETRY_DELAY_S entre intentos.  El watchdog _pending_watchdog
+    cubre el caso donde el PUBACK llega pero el ESP32 no recibe el mensaje
+    (sesion limpia + ESP32 desconectado en el momento del publish).
     """
     try:
         if tanque == 1:
@@ -302,45 +316,61 @@ def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
                     _active_sequence_times.pop(tanque, None)
                 return
 
-        if not _mqtt_connected.wait(timeout=10):
-            print(f"[MEDIR] Sin conexión MQTT tras 10 s. Abortando tanque={tanque}.")
+        payload  = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
+        published = False
+
+        for attempt in range(1, _PUBLISH_RETRY_MAX + 1):
+            if not _mqtt_connected.wait(timeout=10):
+                print(f"[MEDIR] Sin MQTT (intento {attempt}/{_PUBLISH_RETRY_MAX}, tanque={tanque})")
+                if attempt < _PUBLISH_RETRY_MAX:
+                    time.sleep(_PUBLISH_RETRY_DELAY_S)
+                    continue
+                with _active_lock:
+                    _active_sequences.discard(tanque)
+                    _active_sequence_times.pop(tanque, None)
+                return
+
+            result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"[MEDIR] Publish fallido rc={result.rc} (intento {attempt}/{_PUBLISH_RETRY_MAX})")
+                if attempt < _PUBLISH_RETRY_MAX:
+                    time.sleep(_PUBLISH_RETRY_DELAY_S)
+                    continue
+                with _active_lock:
+                    _active_sequences.discard(tanque)
+                    _active_sequence_times.pop(tanque, None)
+                return
+
+            try:
+                result.wait_for_publish(timeout=10)
+            except Exception:
+                pass
+
+            if result.is_published():
+                context = {
+                    "modulo": modulo, "tanque": tanque, "balsa": balsa,
+                    "_published_at": time.time(), "_retry_count": 0,
+                }
+                with _pending_lock:
+                    _pending[tanque] = context
+                print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload} (intento {attempt})")
+                published = True
+                break
+            else:
+                print(f"[MEDIR] Sin PUBACK en 10s (intento {attempt}/{_PUBLISH_RETRY_MAX}, tanque={tanque})")
+                if attempt < _PUBLISH_RETRY_MAX:
+                    time.sleep(_PUBLISH_RETRY_DELAY_S)
+
+        if not published:
+            print(f"[MEDIR] Todos los intentos fallidos. Abortando tanque={tanque}.")
             with _active_lock:
                 _active_sequences.discard(tanque)
                 _active_sequence_times.pop(tanque, None)
-            return
 
-        context = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
-        with _pending_lock:
-            _pending[tanque] = context
-
-        payload = {"modulo": modulo, "tanque": tanque, "balsa": balsa}
-        result = client.publish(REQUEST_TOPIC, json.dumps(payload), qos=1)
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            print(f"[MEDIR] MQTT publish fallido (rc={result.rc})")
-            with _pending_lock:
-                _pending.pop(tanque, None)
-            with _active_lock:
-                _active_sequences.discard(tanque)
-                _active_sequence_times.pop(tanque, None)
-            return
-
-        # Esperar PUBACK del broker (confirma entrega real, no solo encole)
-        try:
-            result.wait_for_publish(timeout=10)
-        except Exception:
-            pass
-        if not result.is_published():
-            print(f"[MEDIR] Broker no confirmó entrega (sin PUBACK en 10 s). Abortando.")
-            with _pending_lock:
-                _pending.pop(tanque, None)
-            with _active_lock:
-                _active_sequences.discard(tanque)
-                _active_sequence_times.pop(tanque, None)
-            return
-
-        print(f"[MEDIR] -> {REQUEST_TOPIC}: {payload}")
     except Exception as e:
-        print(f"[MEDIR] Error inesperado en secuencia (tanque={tanque}): {e}")
+        print(f"[MEDIR] Error inesperado (tanque={tanque}): {e}")
+        with _pending_lock:
+            _pending.pop(tanque, None)
         with _active_lock:
             _active_sequences.discard(tanque)
             _active_sequence_times.pop(tanque, None)
@@ -474,6 +504,80 @@ def _start_peris_sequence(peris: int, estado: bool) -> None:
         print(f"[TANKMIX] Error en peristáltica Peris_{peris}: {e}")
 
 
+# ── MQTT helpers ─────────────────────────────────────────────────────────────
+
+def _republish_pending(t_num: int) -> None:
+    """
+    Re-publica el request MQTT para el tanque dado si hay una medicion pendiente.
+    Llamado desde on_connect (reconexion del subscriber) y on_message cuando
+    el ESP32 vuelve a conectarse (status = "online").
+
+    El PUBACK confirma entrega Pi→broker, pero NO broker→ESP32.  Si el ESP32
+    tenia sesion limpia y estaba offline cuando se publico el request original,
+    el broker descarto el mensaje.  Esta funcion recupera ese caso.
+    """
+    with _pending_lock:
+        ctx = _pending.get(t_num)
+    if ctx is None:
+        return
+    if not _mqtt_connected.is_set():
+        return
+    req = {"modulo": ctx["modulo"], "tanque": t_num, "balsa": ctx["balsa"]}
+    r = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
+    if r.rc == mqtt.MQTT_ERR_SUCCESS:
+        with _pending_lock:
+            if t_num in _pending:
+                _pending[t_num]["_published_at"] = time.time()
+                _pending[t_num]["_retry_count"] = _pending[t_num].get("_retry_count", 0) + 1
+        print(f"[MQTT] Re-publicado request tanque={t_num}")
+    else:
+        print(f"[MQTT] Re-publicacion fallida tanque={t_num} rc={r.rc}")
+
+
+def _pending_watchdog() -> None:
+    """
+    Hilo daemon. Cada WATCHDOG_INTERVAL_S escanea _pending en busca de requests
+    sin respuesta del ESP32.  Si un entry lleva > WATCHDOG_RETRY_AFTER_S sin
+    respuesta, re-publica el request via _republish_pending.
+    Tras WATCHDOG_MAX_RETRIES re-publicaciones sin exito, limpia el entry y
+    libera _active_sequences para desbloquear la siguiente llamada a /medir.
+    """
+    while True:
+        time.sleep(WATCHDOG_INTERVAL_S)
+        now = time.time()
+        with _pending_lock:
+            stale = {
+                t: dict(ctx)
+                for t, ctx in _pending.items()
+                if (now - ctx.get("_published_at", now)) > WATCHDOG_RETRY_AFTER_S
+            }
+
+        for t_num, ctx in stale.items():
+            retry_count = ctx.get("_retry_count", 0)
+            if retry_count >= WATCHDOG_MAX_RETRIES:
+                print(
+                    f"[WATCHDOG] Tanque={t_num} sin respuesta tras "
+                    f"{WATCHDOG_MAX_RETRIES} reintentos. Limpiando."
+                )
+                with _pending_lock:
+                    _pending.pop(t_num, None)
+                with _active_lock:
+                    _active_sequences.discard(t_num)
+                    _active_sequence_times.pop(t_num, None)
+                continue
+
+            if not _mqtt_connected.is_set():
+                print(f"[WATCHDOG] Sin MQTT. Postergando re-publicacion tanque={t_num}.")
+                continue
+
+            print(
+                f"[WATCHDOG] Tanque={t_num} sin respuesta tras "
+                f"{now - ctx.get('_published_at', now):.0f}s. "
+                f"Re-publicando (reintento {retry_count + 1}/{WATCHDOG_MAX_RETRIES})."
+            )
+            _republish_pending(t_num)
+
+
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
 
 def on_connect(client, userdata, flags, rc):
@@ -487,6 +591,14 @@ def on_connect(client, userdata, flags, rc):
         print(f"Subscribed to: {DISTRIBUTION_TANK_TOPIC}")
         print(f"Subscribed to: {STATUS_TOPIC}")
         print(f"Will publish measurement requests to: {REQUEST_TOPIC}")
+        # Re-publicar requests pendientes: si el subscriber se reconecto al broker,
+        # los mensajes anteriores pueden haberse perdido (broker reiniciado, etc.)
+        with _pending_lock:
+            pending_snapshot = list(_pending.keys())
+        if pending_snapshot:
+            print(f"[MQTT] Reconexion: re-publicando {len(pending_snapshot)} request(s) pendiente(s)")
+            for t_num in pending_snapshot:
+                _republish_pending(t_num)
         print()
     else:
         _mqtt_connected.clear()
@@ -506,6 +618,17 @@ def on_message(client, userdata, msg):
         estado = msg.payload.decode(errors="replace").strip()
         _node_status[msg.topic] = estado
         print(f"[STATUS] {msg.topic} → {estado}")
+        if estado == "online":
+            # El ESP32 acaba de reconectarse.  Si habia un request pendiente para
+            # este tanque, el broker ya lo descarto (sesion limpia).  Re-publicar.
+            parts = msg.topic.split("/")
+            if len(parts) >= 2:
+                tank_str = parts[1]
+                try:
+                    t_num = int(tank_str[5:]) if tank_str.startswith("tank_") else int(tank_str)
+                    _republish_pending(t_num)
+                except (ValueError, IndexError):
+                    pass
         return
 
     try:
@@ -565,6 +688,11 @@ client.reconnect_delay_set(min_delay=2, max_delay=30)
 
 client.connect(BROKER, PORT)
 client.loop_start()
+
+_watchdog_thread = threading.Thread(
+    target=_pending_watchdog, daemon=True, name="pending-watchdog"
+)
+_watchdog_thread.start()
 
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
