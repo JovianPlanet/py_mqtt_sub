@@ -422,13 +422,15 @@ def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> Non
             print(f"[TANKMIX] Error cerrando Entrada EPM: {e}")
         return
 
+    # _fill_active ya fue reservado sincrónicamente por el handler (cierra el
+    # hueco con /medir t2). Si falla la apertura de la válvula, lo liberamos.
     try:
         asyncio.run(_open_epm())
     except Exception as e:
         print(f"[TANKMIX] Error abriendo Entrada EPM: {e}")
+        _fill_active.clear()
         return
 
-    _fill_active.set()
     print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
 
     t_inicio = time.time()
@@ -545,34 +547,53 @@ def _pending_watchdog() -> None:
     while True:
         time.sleep(WATCHDOG_INTERVAL_S)
         now = time.time()
+        # Snapshot: (published_at, retry_count) por tanque.  published_at es la
+        # marca única que identifica ESTA petición; se usa después para verificar
+        # que la entrada no fue reemplazada por un /medir nuevo antes de actuar.
         with _pending_lock:
             stale = {
-                t: dict(ctx)
+                t: (ctx.get("_published_at", now), ctx.get("_retry_count", 0))
                 for t, ctx in _pending.items()
                 if (now - ctx.get("_published_at", now)) > WATCHDOG_RETRY_AFTER_S
             }
 
-        for t_num, ctx in stale.items():
-            retry_count = ctx.get("_retry_count", 0)
+        for t_num, (pub_at, retry_count) in stale.items():
             if retry_count >= WATCHDOG_MAX_RETRIES:
-                print(
-                    f"[WATCHDOG] Tanque={t_num} sin respuesta tras "
-                    f"{WATCHDOG_MAX_RETRIES} reintentos. Limpiando."
-                )
+                # Limpieza atómica: solo si la entrada sigue siendo la misma.
+                # Evita borrar una petición nueva que entró mientras decidíamos.
+                removed = False
                 with _pending_lock:
-                    _pending.pop(t_num, None)
-                with _active_lock:
-                    _active_sequences.discard(t_num)
-                    _active_sequence_times.pop(t_num, None)
+                    cur = _pending.get(t_num)
+                    if cur is not None and cur.get("_published_at") == pub_at:
+                        _pending.pop(t_num, None)
+                        removed = True
+                # Solo liberar _active_sequences si nosotros removimos la entrada.
+                # Un /medir nuevo se bloquea con 409 mientras _active siga puesto,
+                # así que no puede colarse otra petición en este hueco.
+                if removed:
+                    with _active_lock:
+                        _active_sequences.discard(t_num)
+                        _active_sequence_times.pop(t_num, None)
+                    print(
+                        f"[WATCHDOG] Tanque={t_num} sin respuesta tras "
+                        f"{WATCHDOG_MAX_RETRIES} reintentos. Limpiado."
+                    )
                 continue
 
             if not _mqtt_connected.is_set():
                 print(f"[WATCHDOG] Sin MQTT. Postergando re-publicacion tanque={t_num}.")
                 continue
 
+            # Re-publicar solo si la entrada no cambió desde el snapshot.
+            with _pending_lock:
+                cur = _pending.get(t_num)
+                still_same = cur is not None and cur.get("_published_at") == pub_at
+            if not still_same:
+                continue
+
             print(
                 f"[WATCHDOG] Tanque={t_num} sin respuesta tras "
-                f"{now - ctx.get('_published_at', now):.0f}s. "
+                f"{now - pub_at:.0f}s. "
                 f"Re-publicando (reintento {retry_count + 1}/{WATCHDOG_MAX_RETRIES})."
             )
             _republish_pending(t_num)
@@ -727,10 +748,13 @@ def handle_medir():
     if tanque not in (1, 2):
         return jsonify({"error": "tanque must be 1 or 2"}), 422
 
-    if tanque == 2 and _fill_active.is_set():
-        return jsonify({"error": "Llenado activo en tanque mix. Detén /entrada_agua primero."}), 409
-
     with _active_lock:
+        # _fill_active se comprueba dentro del lock para excluir mutuamente con
+        # /entrada_agua: ambos publican requests t2 y solaparlos corrompería la
+        # atribución de la lectura. La reserva de /entrada_agua también ocurre
+        # bajo _active_lock, así que ambos handlers se serializan aquí.
+        if tanque == 2 and _fill_active.is_set():
+            return jsonify({"error": "Llenado activo en tanque mix. Detén /entrada_agua primero."}), 409
         if tanque in _active_sequences:
             added_at = _active_sequence_times.get(tanque, 0)
             if (time.time() - added_at) < ACTIVE_SEQUENCE_TIMEOUT_S:
@@ -967,8 +991,22 @@ def handle_entrada_agua():
     if estado and volumen <= 0:
         return jsonify({"error": "volumen must be > 0"}), 422
 
-    if estado and _fill_active.is_set():
-        return jsonify({"error": "Ya hay un llenado activo. Envía estado=false para detenerlo primero."}), 409
+    if estado:
+        # Reserva atómica del recurso "tanque mix" bajo _active_lock: rechaza si
+        # ya hay un llenado activo o una medición /medir en curso. _fill_active se
+        # marca aquí (sincrónicamente), no en el thread, para que /medir t2 lo vea
+        # de inmediato y no se cuele en el hueco de arranque.
+        with _active_lock:
+            if _fill_active.is_set():
+                return jsonify({"error": "Ya hay un llenado activo. Envía estado=false para detenerlo primero."}), 409
+            if 2 in _active_sequences:
+                added_at = _active_sequence_times.get(2, 0)
+                if (time.time() - added_at) < ACTIVE_SEQUENCE_TIMEOUT_S:
+                    return jsonify({"error": "Medición activa en tanque mix. Espera a que termine o usa /abortar."}), 409
+                print("[ENTRADA_AGUA] Auto-limpiando /medir bloqueado para tanque=2")
+                _active_sequences.discard(2)
+                _active_sequence_times.pop(2, None)
+            _fill_active.set()
 
     t = threading.Thread(
         target=_start_entrada_agua_sequence,
