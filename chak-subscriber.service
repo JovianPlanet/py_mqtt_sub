@@ -1,0 +1,20 @@
+[Unit]
+Description=CHAK Subscriber (gateway MQTT/HTTP hidroponia)
+# Espera a la red y a que Mosquitto este arriba antes de arrancar
+After=network-online.target mosquitto.service
+Wants=network-online.target
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+# Ajusta User al dueno del repositorio (p.ej. pi)
+User=pi
+# Ajusta las tres rutas a la ubicacion real del repo en la Pi
+WorkingDirectory=/home/pi/py_mqtt_sub
+EnvironmentFile=/home/pi/py_mqtt_sub/.env
+ExecStart=/home/pi/py_mqtt_sub/venv/bin/python /home/pi/py_mqtt_sub/chak_subscriber.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
