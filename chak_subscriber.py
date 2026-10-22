@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import threading
 import requests
@@ -23,14 +24,19 @@ API_KEY      = os.getenv("API_KEY", "")
 # ── Kincony a64_prod ──────────────────────────────────────────────────────────
 A64_HOST          = os.getenv("A64_HOST", "192.168.0.103")
 A64_PORT          = int(os.getenv("A64_PORT", "6053"))
-A64_NOISE_KEY     = os.getenv("A64_NOISE_KEY", "Dw3Z3r2KbL05KstmqaTSWpxvY/6A4WoRcOUKgq6W99Y=")
+A64_NOISE_KEY     = os.getenv("A64_NOISE_KEY")
 A64_EXPECTED_NAME = os.getenv("A64_EXPECTED_NAME", "produccion")
 
 # ── Kincony tank-mix ──────────────────────────────────────────────────────────
 TANKMIX_HOST          = os.getenv("TANKMIX_HOST", "192.168.0.102")
 TANKMIX_PORT          = int(os.getenv("TANKMIX_PORT", "6053"))
-TANKMIX_NOISE_KEY     = os.getenv("TANKMIX_NOISE_KEY", "ojkGTpvfiDJwONH69xSDFDImSyLZZfT6IuCcNwL28gU=")
+TANKMIX_NOISE_KEY     = os.getenv("TANKMIX_NOISE_KEY")
 TANKMIX_EXPECTED_NAME = os.getenv("TANKMIX_EXPECTED_NAME", "tank-mix")
+
+# Las claves Noise son obligatorias y solo se leen del .env (nunca del código).
+_faltantes = [v for v in ("A64_NOISE_KEY", "TANKMIX_NOISE_KEY") if not os.getenv(v)]
+if _faltantes:
+    sys.exit(f"[CONFIG] Faltan variables obligatorias en .env: {', '.join(_faltantes)}")
 
 # ── Tiempos configurables (segundos) ─────────────────────────────────────────
 T_SUCCION      = int(os.getenv("T_SUCCION",      str(10 * 60)))

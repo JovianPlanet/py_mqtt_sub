@@ -46,8 +46,10 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Dict, Optional
 
+from dotenv import load_dotenv
 from aioesphomeapi import (
     APIClient,
     APIConnectionError,
@@ -61,12 +63,12 @@ from aioesphomeapi import (
 )
 
 # --------------------------- Configuración --------------------------------
+# La clave Noise solo se lee del .env del repositorio (o del entorno), nunca del código.
+load_dotenv(Path(__file__).with_name(".env"))
+
 DEFAULT_HOST = os.environ.get("TANKMIX_HOST", "192.168.0.102")
 DEFAULT_PORT = int(os.environ.get("TANKMIX_PORT", "6053"))
-DEFAULT_NOISE_KEY = os.environ.get(
-    "TANKMIX_NOISE_KEY",
-    "ojkGTpvfiDJwONH69xSDFDImSyLZZfT6IuCcNwL28gU=",
-)
+DEFAULT_NOISE_KEY = os.environ.get("TANKMIX_NOISE_KEY")
 DEFAULT_EXPECTED_NAME = os.environ.get("TANKMIX_EXPECTED_NAME", "tank-mix")
 
 log = logging.getLogger("tankmix")
@@ -90,6 +92,10 @@ class TankMixClient:
         password: str = "",
         keepalive: float = 15.0,
     ) -> None:
+        if not noise_psk:
+            raise RuntimeError(
+                "Falta la clave Noise: defina TANKMIX_NOISE_KEY en el .env o use --noise-key."
+            )
         self._host = host
         self._port = port
         self._client = APIClient(
