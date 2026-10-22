@@ -68,6 +68,8 @@ MIXING_TANK_TOPIC       = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
 STATUS_TOPIC  = "status/+"
+NIVEL_TOPIC   = "nivel/+"     # telemetría de nivel de los nodos (cada ~5 s)
+ALARMA_TOPIC  = "alarma/+"    # alarmas de nivel de los nodos (retenidas)
 
 # Solicitudes pendientes de respuesta ESP32: tanque (int) -> {modulo, tanque, balsa}
 _pending: dict = {}
@@ -90,6 +92,22 @@ WATCHDOG_MAX_RETRIES   = 3    # máximo de re-publicaciones por request
 
 # Estado de conexión de nodos: "status/tank_N" -> "online" | "offline"
 _node_status: dict = {}
+
+# ── Supervisión de niveles (telemetría y alarmas publicadas por los nodos) ────
+# Tanque 1 = distribución, tanque 2 = mix.
+NIVEL_DATOS_MAX_S = int(os.getenv("NIVEL_DATOS_MAX_S", 30))  # antigüedad máx. de la última lectura válida (s)
+NOMBRE_TANQUE = {1: "distribución", 2: "mix"}
+# Condiciones de cada operación: [(tanque, alarma que la impide o la detiene)].
+# Además, cada tanque listado debe tener datos recientes, nodo en línea y sensor sin falla.
+REQ_NIVEL = {
+    "llenado_mix":  [(2, "alto")],               # Entrada EPM → mix: desborde del mix
+    "mix_a_dist":   [(1, "alto"), (2, "bajo")],  # Motobomba: desborde en dist / mix en seco
+    "dist_a_mix":   [(2, "alto"), (1, "bajo")],  # A_MB200: desborde en mix / dist en seco
+    "llenar_balsa": [(1, "bajo")],               # A_MB200 desde distribución en seco
+    "succion":      [(1, "alto")],               # balsa → distribución: desborde en dist
+}
+_niveles: dict = {}   # tanque -> {"level", "h_cm", "ts" (monotonic de la última lectura válida), "alarma"}
+_niveles_lock = threading.Lock()
 
 # Último nivel conocido del tanque mix — actualizado en on_message
 _last_mix_level: float = 0.0
@@ -194,11 +212,78 @@ def _cliente(placa: str):
     return _a64_client() if placa == "a64" else _tankmix_client()
 
 
+# ── Supervisión de niveles ────────────────────────────────────────────────────
+
+def _tanque_de_topic(topic: str):
+    """Devuelve el número de tanque de "nivel/tank_2" (2), o None si no aplica."""
+    try:
+        return int(topic.split("/", 1)[1].replace("tank_", ""))
+    except (IndexError, ValueError):
+        return None
+
+
+def _registrar_nivel(topic: str, texto: str) -> None:
+    """Actualiza el estado del tanque con un mensaje de nivel/+ o alarma/+."""
+    tanque = _tanque_de_topic(topic)
+    if tanque is None:
+        return
+    with _niveles_lock:
+        est = _niveles.setdefault(tanque, {"level": None, "h_cm": None, "ts": None,
+                                           "alarma": "desconocido"})
+        previa = est["alarma"]
+        if topic.startswith("alarma/"):
+            est["alarma"] = texto
+        else:
+            try:
+                datos = json.loads(texto)
+            except json.JSONDecodeError:
+                return
+            if datos.get("alarma"):
+                est["alarma"] = str(datos["alarma"])
+            if datos.get("ok"):
+                est["level"] = float(datos.get("level", 0.0))
+                est["h_cm"] = float(datos.get("h_cm", 0.0))
+                est["ts"] = time.monotonic()
+        nueva = est["alarma"]
+    if nueva != previa:
+        print(f"[NIVEL] Tanque {NOMBRE_TANQUE.get(tanque, tanque)}: alarma {previa} -> {nueva}")
+
+
+def _nivel_actual(tanque: int):
+    """Último nivel válido (L) del tanque si es reciente; si no, None."""
+    with _niveles_lock:
+        est = _niveles.get(tanque)
+        if not est or est["ts"] is None or time.monotonic() - est["ts"] > NIVEL_DATOS_MAX_S:
+            return None
+        return est["level"]
+
+
+def _motivo_nivel(requisitos):
+    """
+    Devuelve el motivo por el que los niveles impiden iniciar o continuar una
+    operación con estos requisitos ([(tanque, alarma_prohibida), ...]), o None.
+    """
+    ahora = time.monotonic()
+    for tanque, prohibida in requisitos:
+        nombre = NOMBRE_TANQUE.get(tanque, f"tanque {tanque}")
+        if _node_status.get(f"status/tank_{tanque}") == "offline":
+            return f"Nodo del tanque {nombre} desconectado"
+        with _niveles_lock:
+            est = dict(_niveles.get(tanque) or {})
+        if not est or est.get("ts") is None or ahora - est["ts"] > NIVEL_DATOS_MAX_S:
+            return f"Sin datos de nivel recientes del tanque {nombre}"
+        if est["alarma"] == "falla_sensor":
+            return f"Falla del sensor de nivel del tanque {nombre}"
+        if est["alarma"] == prohibida:
+            return f"Tanque {nombre} en nivel {prohibida}"
+    return None
+
+
 # ── Actuación segura ──────────────────────────────────────────────────────────
 # Cada secuencia mantiene abierta la conexión con la placa mientras sus salidas
 # están encendidas y, termine como termine, apaga con _asegurar_apagado().
 
-def _motivo_corte(gen: int, clientes=(), mientras=None):
+def _motivo_corte(gen: int, clientes=(), mientras=None, requisitos=()):
     """Devuelve el motivo para interrumpir una secuencia, o None si puede seguir."""
     if gen != _parada_gen:
         return "Parada de emergencia"
@@ -207,17 +292,20 @@ def _motivo_corte(gen: int, clientes=(), mientras=None):
     for c in clientes:
         if not c.connected:
             return f"Comunicación perdida con {c.label}"
+    if requisitos:
+        return _motivo_nivel(requisitos)
     return None
 
 
-async def _esperar(segundos: float, gen: int, clientes=(), evento=None, mientras=None) -> str:
+async def _esperar(segundos: float, gen: int, clientes=(), evento=None, mientras=None,
+                   requisitos=()) -> str:
     """
     Espera en pasos cortos para poder reaccionar a tiempo. Devuelve "ok" si se
     cumplió el tiempo, "evento" si `evento` se activó antes, o el motivo de corte.
     """
     fin = time.monotonic() + segundos
     while True:
-        motivo = _motivo_corte(gen, clientes, mientras)
+        motivo = _motivo_corte(gen, clientes, mientras, requisitos)
         if motivo:
             return motivo
         if evento is not None and evento.is_set():
@@ -280,13 +368,18 @@ async def _asegurar_apagado(pasos, vivos=None) -> bool:
     return False
 
 
-async def _pulso(etiqueta: str, pasos, duracion: float):
+async def _pulso(etiqueta: str, pasos, duracion: float, requisitos=()):
     """
     Enciende `pasos` ([(placa, nombre), ...]) en orden, espera `duracion` s
-    (interrumpible) y apaga en orden inverso con _asegurar_apagado().
+    (interrumpible, también por los niveles de `requisitos`) y apaga en orden
+    inverso con _asegurar_apagado(). No arranca si los niveles ya lo impiden.
     Devuelve None si terminó normalmente o el motivo de la interrupción.
     """
     gen = _parada_gen
+    motivo = _motivo_nivel(requisitos) if requisitos else None
+    if motivo:
+        print(f"[SEGURIDAD] {etiqueta} no se inicia: {motivo}")
+        return motivo
     apagado = list(reversed(pasos))
     vivos = {}
     activado = False
@@ -298,7 +391,7 @@ async def _pulso(etiqueta: str, pasos, duracion: float):
         for placa, nombre in pasos:
             if not await vivos[placa].set_switch_confirmed(nombre, True):
                 raise RuntimeError(f"{nombre} no confirmó el encendido")
-        motivo = await _esperar(duracion, gen, list(vivos.values()))
+        motivo = await _esperar(duracion, gen, list(vivos.values()), requisitos=requisitos)
         if motivo != "ok":
             print(f"[SEGURIDAD] {etiqueta} interrumpido: {motivo}. Apagando.")
         activado = False   # a partir de aquí el apagado se gestiona en esta misma rama
@@ -320,7 +413,8 @@ async def _pulso(etiqueta: str, pasos, duracion: float):
 async def _suction_sequence(balsa: int) -> None:
     ev_out = f"EV_OUT_BAND_{balsa:02d}"
     print(f"[A64] Iniciando succion: {ev_out} + A_MB_Succion ({T_SUCCION}s)")
-    motivo = await _pulso("Succión", [("a64", ev_out), ("a64", "A_MB_Succion ")], T_SUCCION)
+    motivo = await _pulso("Succión", [("a64", ev_out), ("a64", "A_MB_Succion ")], T_SUCCION,
+                          REQ_NIVEL["succion"])
     if motivo:
         raise RuntimeError(f"succión interrumpida ({motivo})")
     print(f"[A64] Succion finalizada: {ev_out}")
@@ -329,21 +423,24 @@ async def _suction_sequence(balsa: int) -> None:
 async def _transferir_dist_mix_sequence() -> None:
     print(f"[A64] Iniciando transferencia dist→mix: A_MB200 + A_EV_OUT_NUTRICION ({T_MB200}s)")
     motivo = await _pulso("Transferencia dist→mix",
-                          [("a64", "A_EV_OUT_NUTRICION"), ("a64", "A_MB200")], T_MB200)
+                          [("a64", "A_EV_OUT_NUTRICION"), ("a64", "A_MB200")], T_MB200,
+                          REQ_NIVEL["dist_a_mix"])
     print("[A64] Transferencia dist→mix " + (f"interrumpida ({motivo})" if motivo else "finalizada"))
 
 
 async def _transferir_mix_dist_sequence() -> None:
     print(f"[TANKMIX] Iniciando transferencia mix→dist: A_EV_IN_NUTRICION + MOTOBOMBA ({T_MBMIX}s)")
     motivo = await _pulso("Transferencia mix→dist",
-                          [("a64", "A_EV_IN_NUTRICION"), ("tankmix", "Motobomba")], T_MBMIX)
+                          [("a64", "A_EV_IN_NUTRICION"), ("tankmix", "Motobomba")], T_MBMIX,
+                          REQ_NIVEL["mix_a_dist"])
     print("[TANKMIX] Transferencia mix→dist " + (f"interrumpida ({motivo})" if motivo else "finalizada"))
 
 
 async def _llenar_sequence(balsa: int) -> None:
     ev_in = f"EV_IN_BAND_{balsa:02d}"
     print(f"[A64] Iniciando llenado: {ev_in} + A_MB200 ({T_MB200}s)")
-    motivo = await _pulso(f"Llenado balsa {balsa}", [("a64", ev_in), ("a64", "A_MB200")], T_MB200)
+    motivo = await _pulso(f"Llenado balsa {balsa}", [("a64", ev_in), ("a64", "A_MB200")], T_MB200,
+                          REQ_NIVEL["llenar_balsa"])
     print(f"[A64] Llenado {f'interrumpido ({motivo})' if motivo else 'finalizado'}: {ev_in}")
 
 
@@ -396,7 +493,8 @@ async def _solicitar_nivel_mix(modulo: str, gen: int, tmix):
     """
     if not _mqtt_connected.is_set():
         print(f"[ENTRADA_AGUA] Sin conexión MQTT. Reintentando en {T_FILL_POLL_S} s...")
-        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
+                          requisitos=REQ_NIVEL["llenado_mix"])
         return None, (None if r == "ok" else r)
 
     _mix_level_event.clear()
@@ -411,10 +509,12 @@ async def _solicitar_nivel_mix(modulo: str, gen: int, tmix):
         publicado = result.is_published()
     if not publicado:
         print(f"[ENTRADA_AGUA] No se pudo publicar la solicitud de nivel. Reintentando en {T_FILL_POLL_S} s")
-        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
+                          requisitos=REQ_NIVEL["llenado_mix"])
         return None, (None if r == "ok" else r)
 
-    r = await _esperar(60, gen, [tmix], evento=_mix_level_event, mientras=_fill_active)
+    r = await _esperar(60, gen, [tmix], evento=_mix_level_event, mientras=_fill_active,
+                          requisitos=REQ_NIVEL["llenado_mix"])
     if r == "evento":
         with _last_mix_level_lock:
             return _last_mix_level, None
@@ -460,7 +560,8 @@ async def _llenado_mix(modulo: str, volumen: int) -> None:
             if nivel >= volumen:
                 motivo = "Volumen alcanzado"
                 break
-            r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+            r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
+                          requisitos=REQ_NIVEL["llenado_mix"])
             if r != "ok":
                 motivo = r
                 break
@@ -788,9 +889,12 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(MIXING_TANK_TOPIC)
         client.subscribe(DISTRIBUTION_TANK_TOPIC)
         client.subscribe(STATUS_TOPIC)
+        client.subscribe(NIVEL_TOPIC)
+        client.subscribe(ALARMA_TOPIC)
         print(f"Subscribed to: {MIXING_TANK_TOPIC}")
         print(f"Subscribed to: {DISTRIBUTION_TANK_TOPIC}")
         print(f"Subscribed to: {STATUS_TOPIC}")
+        print(f"Subscribed to: {NIVEL_TOPIC}, {ALARMA_TOPIC}")
         print(f"Will publish measurement requests to: {REQUEST_TOPIC}")
         # Re-publicar requests pendientes: si el subscriber se reconecto al broker,
         # los mensajes anteriores pueden haberse perdido (broker reiniciado, etc.)
@@ -818,6 +922,11 @@ def on_message(client, userdata, msg):
     # Sin «global» la asignación de abajo creaba una variable local y el bucle de
     # llenado leía siempre 0.0 L: nunca alcanzaba el volumen objetivo.
     global _last_mix_level
+    # Telemetría y alarmas de nivel: solo alimentan la supervisión; nunca se
+    # reenvían a la API ni se confunden con la respuesta de una medición.
+    if msg.topic.startswith(("nivel/", "alarma/")):
+        _registrar_nivel(msg.topic, msg.payload.decode(errors="replace").strip())
+        return
     if msg.topic.startswith("status/"):
         estado = msg.payload.decode(errors="replace").strip()
         _node_status[msg.topic] = estado
