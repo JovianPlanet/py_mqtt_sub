@@ -52,6 +52,18 @@ T_DOSIFICACION = int(os.getenv("T_DOSIFICACION",  51))
 APAGADO_INTENTOS   = 6
 APAGADO_ESPERA_MAX = 15
 
+# Actuadores críticos (bombas, válvulas hidráulicas, ozono y dosificación): se
+# apagan al arrancar el servicio y en la parada de emergencia. Primero las bombas,
+# luego las válvulas. Las luces y los agitadores no se incluyen.
+N_BALSAS = int(os.getenv("N_BALSAS", 15))
+ACTUADORES_CRITICOS = (
+    [("tankmix", n) for n in ("Motobomba", "Ozono", "Peris_1", "Peris_2", "Peris_3",
+                              "Peris_4", "Entrada EPM")]
+    + [("a64", n) for n in ("A_MB_Succion ", "A_MB200", "A_EV_OUT_NUTRICION", "A_EV_IN_NUTRICION")]
+    + [("a64", f"EV_OUT_BAND_{b:02d}") for b in range(1, N_BALSAS + 1)]
+    + [("a64", f"EV_IN_BAND_{b:02d}") for b in range(1, N_BALSAS + 1)]
+)
+
 MIXING_TANK_TOPIC       = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
@@ -94,6 +106,9 @@ _mqtt_connected = threading.Event()
 # capturan al iniciar y se interrumpen en cuanto cambia.
 _parada_gen = 0
 _parada_lock = threading.Lock()
+
+# Hasta que termine el apagado de arranque no se aceptan operaciones hidráulicas.
+_arranque_seguro = threading.Event()
 
 
 def _safe_response_body(r):
@@ -486,6 +501,30 @@ async def _peris_sequence(peris: int, estado: bool) -> None:
     print(f"[TANKMIX] {name} {f'interrumpido ({motivo})' if motivo else 'completado'}")
 
 
+def _apagado_de_arranque() -> None:
+    """
+    Al iniciar el servicio apaga los actuadores críticos: cubre una operación que
+    haya quedado a medias por un reinicio del servicio o un corte de energía.
+    """
+    print("[SEGURIDAD] Estado seguro al arrancar: apagando actuadores críticos...")
+    try:
+        ok = asyncio.run(_asegurar_apagado(ACTUADORES_CRITICOS))
+        print("[SEGURIDAD] Actuadores críticos apagados." if ok else
+              "[SEGURIDAD] No se pudo confirmar el apagado de todos los actuadores críticos.")
+    except Exception as e:
+        print(f"[SEGURIDAD] Error en el apagado de arranque: {e}")
+    finally:
+        _arranque_seguro.set()
+
+
+def _bloqueo_arranque():
+    """Respuesta 503 mientras no termine el apagado de arranque; si no, None."""
+    if not _arranque_seguro.is_set():
+        return jsonify({"error": "Inicializando estado seguro de actuadores. "
+                                 "Reintente en unos segundos."}), 503
+    return None
+
+
 # ── Thread starters ───────────────────────────────────────────────────────────
 
 def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
@@ -859,6 +898,8 @@ _watchdog_thread = threading.Thread(
 )
 _watchdog_thread.start()
 
+threading.Thread(target=_apagado_de_arranque, daemon=True, name="arranque-seguro").start()
+
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -891,6 +932,9 @@ def handle_medir():
 
     if tanque not in (1, 2):
         return jsonify({"error": "tanque must be 1 or 2"}), 422
+
+    if tanque == 1 and (bloqueo := _bloqueo_arranque()):
+        return bloqueo
 
     with _active_lock:
         # _fill_active se comprueba dentro del lock para excluir mutuamente con
@@ -951,6 +995,9 @@ def handle_transferir():
     if tanque not in (1, 2):
         return jsonify({"error": "tanque must be 1 or 2"}), 422
 
+    if (bloqueo := _bloqueo_arranque()):
+        return bloqueo
+
     t = threading.Thread(
         target=_start_transferir_sequence,
         args=(tanque,),
@@ -991,6 +1038,9 @@ def handle_llenar():
 
     if balsa < 1:
         return jsonify({"error": "balsa must be >= 1"}), 422
+
+    if (bloqueo := _bloqueo_arranque()):
+        return bloqueo
 
     t = threading.Thread(
         target=_start_llenar_sequence,
@@ -1135,6 +1185,9 @@ def handle_entrada_agua():
     if estado and volumen <= 0:
         return jsonify({"error": "volumen must be > 0"}), 422
 
+    if estado and (bloqueo := _bloqueo_arranque()):
+        return bloqueo
+
     if estado:
         # Reserva atómica del recurso "tanque mix" bajo _active_lock: rechaza si
         # ya hay un llenado activo o una medición /medir en curso. _fill_active se
@@ -1191,6 +1244,9 @@ def handle_ozono():
 
     estado = bool(data["estado"])
 
+    if estado and (bloqueo := _bloqueo_arranque()):
+        return bloqueo
+
     t = threading.Thread(
         target=_start_ozono_sequence,
         args=(estado,),
@@ -1230,6 +1286,9 @@ def handle_peris():
 
     if peris not in (1, 2, 3, 4):
         return jsonify({"error": "peris must be 1, 2, 3 or 4"}), 422
+
+    if estado and (bloqueo := _bloqueo_arranque()):
+        return bloqueo
 
     t = threading.Thread(
         target=_start_peris_sequence,
