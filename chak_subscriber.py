@@ -488,18 +488,25 @@ async def _agitador_sequence(tanque: int, estado: bool) -> None:
         print(f"[AGITADOR] Agitador (tank-mix) {'encendido' if estado else 'apagado'}")
 
 
-async def _llenado_mix(modulo: str, volumen: int) -> None:
+async def _llenado_mix(modulo: str, litros: int) -> None:
     """
-    Abre Entrada EPM manteniendo la conexión con tank-mix durante todo el llenado
-    y sigue el nivel con la telemetría del nodo del mix (nivel/tank_2). Cierra la
-    válvula (con garantía) al alcanzar el volumen o ante cualquier condición de
-    corte: detención externa, parada de emergencia, comunicación perdida con la
-    placa, alarma «alto» del mix, datos de nivel obsoletos o nodo desconectado,
-    nivel que no sube en T_SIN_PROGRESO_S, o T_FILL_MAX_S cumplido.
+    Añade `litros` de agua de red al tanque mix. Toma como referencia el nivel
+    actual (telemetría del nodo del mix, nivel/tank_2) justo antes de abrir y
+    cierra Entrada EPM al alcanzar nivel_inicial + litros.
+    Mantiene la conexión con tank-mix durante todo el llenado y cierra la válvula
+    (con garantía) también ante cualquier condición de corte: detención externa,
+    parada de emergencia, comunicación perdida con la placa, alarma «alto» del
+    mix, datos de nivel obsoletos o nodo desconectado, nivel que no sube en
+    T_SIN_PROGRESO_S, o T_FILL_MAX_S cumplido.
     """
     gen = _parada_gen
     pasos = [("tankmix", "Entrada EPM")]
     requisitos = REQ_NIVEL["llenado_mix"]
+    nivel_inicial = _nivel_actual(2)
+    if nivel_inicial is None:
+        print("[ENTRADA_AGUA] Sin datos de nivel recientes del tanque mix: no se abre la Entrada EPM.")
+        return
+    objetivo = nivel_inicial + litros
     vivos = {}
     activado = False
     pila = AsyncExitStack()
@@ -510,7 +517,8 @@ async def _llenado_mix(modulo: str, volumen: int) -> None:
         if not await tmix.set_switch_confirmed("Entrada EPM", True):
             raise RuntimeError("Entrada EPM no confirmó la apertura")
         print("[TANKMIX] Entrada EPM abierta")
-        print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
+        print(f"[ENTRADA_AGUA] Monitoreo iniciado. Añadir {litros} L: nivel inicial "
+              f"{nivel_inicial:.2f} L → objetivo {objetivo:.2f} L")
 
         t_inicio = time.monotonic()
         ultimo_log = None
@@ -522,10 +530,11 @@ async def _llenado_mix(modulo: str, volumen: int) -> None:
                 break
             nivel = _nivel_actual(2)
             if nivel is not None:
-                alcanzado = nivel >= volumen
+                alcanzado = nivel >= objetivo
                 if alcanzado or ultimo_log is None or ahora - ultimo_log >= T_FILL_POLL_S:
-                    print(f"[ENTRADA_AGUA] Nivel: {nivel:.2f} L / objetivo: {volumen} L "
-                          f"(t={int(ahora - t_inicio)}s)")
+                    print(f"[ENTRADA_AGUA] Nivel: {nivel:.2f} L / objetivo: {objetivo:.2f} L "
+                          f"(añadidos {nivel - nivel_inicial:.2f} de {litros} L, "
+                          f"t={int(ahora - t_inicio)}s)")
                     ultimo_log = ahora
                 if alcanzado:
                     motivo = "Volumen alcanzado"
@@ -734,9 +743,9 @@ def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> Non
     """
     Corre en un thread daemon.
     estado=False: detiene el llenado activo (si lo hay) y asegura el cierre de Entrada EPM.
-    estado=True:  ejecuta _llenado_mix(): abre Entrada EPM, sigue el nivel con la
-                  telemetría del nodo del mix y cierra al alcanzar el volumen o ante
-                  cualquier condición de corte (ver _llenado_mix).
+    estado=True:  ejecuta _llenado_mix(): añade `volumen` litros al tanque mix
+                  (nivel inicial + volumen), siguiendo el nivel con la telemetría del
+                  nodo, y cierra al alcanzarlo o ante cualquier condición de corte.
     """
     if not estado:
         _fill_active.clear()   # el llenado en curso cierra la válvula al salir
@@ -1265,8 +1274,9 @@ def handle_entrada_agua():
 
     JSON esperado: {"modulo": <uuid>, "volumen": <int>, "estado": true|false}
 
-    estado=true:  abre Entrada EPM y monitorea el nivel del tanque mix vía MQTT.
-                  Cierra la válvula automáticamente cuando nivel >= volumen (L).
+    volumen: litros de agua a AÑADIR al tanque mix (no el nivel final).
+    estado=true:  abre Entrada EPM y la cierra automáticamente cuando el nivel
+                  alcanza nivel_inicial + volumen (telemetría del nodo del mix).
                   Timeout de seguridad: T_FILL_MAX_S segundos.
     estado=false: cierra Entrada EPM inmediatamente y aborta el llenado activo.
     """
@@ -1319,7 +1329,7 @@ def handle_entrada_agua():
     if estado:
         return jsonify({
             "status": "queued",
-            "volumen_objetivo_L": volumen,
+            "litros_a_anadir": volumen,
             "poll_interval_s": T_FILL_POLL_S,
             "timeout_max_s": T_FILL_MAX_S,
         }), 202
