@@ -45,6 +45,9 @@ T_MB200        = int(os.getenv("T_MB200",        str(10 * 60)))
 T_MBMIX        = int(os.getenv("T_MBMIX",        str(10 * 60)))
 T_FILL_POLL_S  = int(os.getenv("T_FILL_POLL_S",  30))   # intervalo entre sondeos de nivel (s)
 T_FILL_MAX_S   = int(os.getenv("T_FILL_MAX_S",   3600)) # timeout de seguridad máximo (s)
+T_SIN_PROGRESO_S = int(os.getenv("T_SIN_PROGRESO_S", 300))   # llenado: tiempo máx. sin que el nivel suba (s)
+PROGRESO_MIN_L   = float(os.getenv("PROGRESO_MIN_L", 2))     # llenado: subida mínima esperada en ese tiempo (L)
+LLENADO_CHEQUEO_S = 2   # cada cuánto se compara el nivel con el objetivo durante el llenado (s)
 T_OZ           = int(os.getenv("T_OZ",           300))
 T_DOSIFICACION = int(os.getenv("T_DOSIFICACION",  51))
 
@@ -485,54 +488,18 @@ async def _agitador_sequence(tanque: int, estado: bool) -> None:
         print(f"[AGITADOR] Agitador (tank-mix) {'encendido' if estado else 'apagado'}")
 
 
-async def _solicitar_nivel_mix(modulo: str, gen: int, tmix):
-    """
-    Pide una medición al nodo del tanque mix y espera la respuesta.
-    Devuelve (nivel_L, None), (None, None) si no hubo respuesta, o
-    (None, motivo) si hay que interrumpir el llenado.
-    """
-    if not _mqtt_connected.is_set():
-        print(f"[ENTRADA_AGUA] Sin conexión MQTT. Reintentando en {T_FILL_POLL_S} s...")
-        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
-                          requisitos=REQ_NIVEL["llenado_mix"])
-        return None, (None if r == "ok" else r)
-
-    _mix_level_event.clear()
-    req = {"modulo": modulo, "tanque": 2, "balsa": 0}
-    result = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
-    publicado = result.rc == mqtt.MQTT_ERR_SUCCESS
-    if publicado:
-        try:
-            await asyncio.to_thread(result.wait_for_publish, 10)
-        except Exception:
-            pass
-        publicado = result.is_published()
-    if not publicado:
-        print(f"[ENTRADA_AGUA] No se pudo publicar la solicitud de nivel. Reintentando en {T_FILL_POLL_S} s")
-        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
-                          requisitos=REQ_NIVEL["llenado_mix"])
-        return None, (None if r == "ok" else r)
-
-    r = await _esperar(60, gen, [tmix], evento=_mix_level_event, mientras=_fill_active,
-                          requisitos=REQ_NIVEL["llenado_mix"])
-    if r == "evento":
-        with _last_mix_level_lock:
-            return _last_mix_level, None
-    if r == "ok":
-        print("[ENTRADA_AGUA] Sin respuesta del ESP32 en 60 s. Reintentando...")
-        return None, None
-    return None, r
-
-
 async def _llenado_mix(modulo: str, volumen: int) -> None:
     """
     Abre Entrada EPM manteniendo la conexión con tank-mix durante todo el llenado
-    y la cierra (con garantía) al alcanzar el volumen, al detenerse externamente,
-    ante una parada de emergencia, si se pierde la comunicación con la placa o al
-    cumplirse T_FILL_MAX_S.
+    y sigue el nivel con la telemetría del nodo del mix (nivel/tank_2). Cierra la
+    válvula (con garantía) al alcanzar el volumen o ante cualquier condición de
+    corte: detención externa, parada de emergencia, comunicación perdida con la
+    placa, alarma «alto» del mix, datos de nivel obsoletos o nodo desconectado,
+    nivel que no sube en T_SIN_PROGRESO_S, o T_FILL_MAX_S cumplido.
     """
     gen = _parada_gen
     pasos = [("tankmix", "Entrada EPM")]
+    requisitos = REQ_NIVEL["llenado_mix"]
     vivos = {}
     activado = False
     pila = AsyncExitStack()
@@ -545,23 +512,32 @@ async def _llenado_mix(modulo: str, volumen: int) -> None:
         print("[TANKMIX] Entrada EPM abierta")
         print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
 
-        t_inicio = time.time()
+        t_inicio = time.monotonic()
+        ultimo_log = None
+        ref_nivel, ref_t = None, t_inicio     # referencia para detectar que el nivel no sube
         while True:
-            if time.time() - t_inicio >= T_FILL_MAX_S:
+            ahora = time.monotonic()
+            if ahora - t_inicio >= T_FILL_MAX_S:
                 motivo = f"Timeout de seguridad ({T_FILL_MAX_S}s)"
                 break
-            nivel, motivo = await _solicitar_nivel_mix(modulo, gen, tmix)
-            if motivo:
-                break
-            if nivel is None:
-                continue
-            elapsed = int(time.time() - t_inicio)
-            print(f"[ENTRADA_AGUA] Nivel: {nivel:.2f} L / objetivo: {volumen} L (t={elapsed}s)")
-            if nivel >= volumen:
-                motivo = "Volumen alcanzado"
-                break
-            r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active,
-                          requisitos=REQ_NIVEL["llenado_mix"])
+            nivel = _nivel_actual(2)
+            if nivel is not None:
+                alcanzado = nivel >= volumen
+                if alcanzado or ultimo_log is None or ahora - ultimo_log >= T_FILL_POLL_S:
+                    print(f"[ENTRADA_AGUA] Nivel: {nivel:.2f} L / objetivo: {volumen} L "
+                          f"(t={int(ahora - t_inicio)}s)")
+                    ultimo_log = ahora
+                if alcanzado:
+                    motivo = "Volumen alcanzado"
+                    break
+                if ref_nivel is None or nivel >= ref_nivel + PROGRESO_MIN_L:
+                    ref_nivel, ref_t = nivel, ahora
+                elif ahora - ref_t >= T_SIN_PROGRESO_S:
+                    motivo = f"El nivel no sube (menos de {PROGRESO_MIN_L:g} L en {T_SIN_PROGRESO_S}s)"
+                    break
+            # Sin dato reciente no se decide nada aquí: _esperar() corta por datos obsoletos.
+            r = await _esperar(LLENADO_CHEQUEO_S, gen, [tmix], mientras=_fill_active,
+                               requisitos=requisitos)
             if r != "ok":
                 motivo = r
                 break
@@ -758,9 +734,9 @@ def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> Non
     """
     Corre en un thread daemon.
     estado=False: detiene el llenado activo (si lo hay) y asegura el cierre de Entrada EPM.
-    estado=True:  ejecuta _llenado_mix(): abre Entrada EPM, monitorea el nivel del
-                  tanque mix vía MQTT y cierra al alcanzar el volumen o ante cualquier
-                  condición de corte (ver _llenado_mix).
+    estado=True:  ejecuta _llenado_mix(): abre Entrada EPM, sigue el nivel con la
+                  telemetría del nodo del mix y cierra al alcanzar el volumen o ante
+                  cualquier condición de corte (ver _llenado_mix).
     """
     if not estado:
         _fill_active.clear()   # el llenado en curso cierra la válvula al salir
