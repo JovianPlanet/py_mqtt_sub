@@ -641,6 +641,9 @@ def on_disconnect(client, userdata, rc):
 
 
 def on_message(client, userdata, msg):
+    # Sin «global» la asignación de abajo creaba una variable local y el bucle de
+    # llenado leía siempre 0.0 L: nunca alcanzaba el volumen objetivo.
+    global _last_mix_level
     if msg.topic.startswith("status/"):
         estado = msg.payload.decode(errors="replace").strip()
         _node_status[msg.topic] = estado
