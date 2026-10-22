@@ -1307,6 +1307,27 @@ def handle_peris():
     }), 202
 
 
+@app.route("/parar", methods=["POST"])
+def handle_parar():
+    """
+    Parada de emergencia: interrumpe las secuencias en curso (succión,
+    transferencias, llenado de balsas, llenado del tanque mix, ozono y
+    dosificación) y apaga todos los actuadores críticos con confirmación.
+
+    No requiere cuerpo. Responde 200 si se confirmó el apagado de todo, o 500
+    si alguna salida no pudo confirmarse (ver log del servicio).
+    """
+    global _parada_gen
+    with _parada_lock:
+        _parada_gen += 1          # las secuencias activas detectan el cambio y se cortan
+    _fill_active.clear()
+    print("[PARADA] Parada de emergencia solicitada. Apagando actuadores críticos...")
+    ok = asyncio.run(_asegurar_apagado(ACTUADORES_CRITICOS))
+    print("[PARADA] Actuadores críticos apagados." if ok else
+          "[PARADA] CRÍTICO: no se pudo confirmar el apagado de todos los actuadores.")
+    return jsonify({"status": "ok" if ok else "incompleto", "apagado_confirmado": ok}), (200 if ok else 500)
+
+
 @app.route("/abortar", methods=["POST"])
 def handle_abortar():
     """
