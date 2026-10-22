@@ -626,6 +626,15 @@ def _bloqueo_arranque():
     return None
 
 
+def _bloqueo_nivel(requisitos):
+    """Respuesta 409 si los niveles impiden iniciar la operación; si no, None."""
+    motivo = _motivo_nivel(requisitos)
+    if motivo:
+        print(f"[SEGURIDAD] Operación rechazada: {motivo}")
+        return jsonify({"error": f"Operación bloqueada por nivel: {motivo}", "motivo": motivo}), 409
+    return None
+
+
 # ── Thread starters ───────────────────────────────────────────────────────────
 
 def _start_medir_sequence(tanque: int, balsa: int, modulo: str) -> None:
@@ -1044,6 +1053,8 @@ def handle_medir():
 
     if tanque == 1 and (bloqueo := _bloqueo_arranque()):
         return bloqueo
+    if tanque == 1 and (bloqueo := _bloqueo_nivel(REQ_NIVEL["succion"])):
+        return bloqueo
 
     with _active_lock:
         # _fill_active se comprueba dentro del lock para excluir mutuamente con
@@ -1106,6 +1117,8 @@ def handle_transferir():
 
     if (bloqueo := _bloqueo_arranque()):
         return bloqueo
+    if (bloqueo := _bloqueo_nivel(REQ_NIVEL["dist_a_mix" if tanque == 1 else "mix_a_dist"])):
+        return bloqueo
 
     t = threading.Thread(
         target=_start_transferir_sequence,
@@ -1149,6 +1162,8 @@ def handle_llenar():
         return jsonify({"error": "balsa must be >= 1"}), 422
 
     if (bloqueo := _bloqueo_arranque()):
+        return bloqueo
+    if (bloqueo := _bloqueo_nivel(REQ_NIVEL["llenar_balsa"])):
         return bloqueo
 
     t = threading.Thread(
@@ -1295,6 +1310,8 @@ def handle_entrada_agua():
         return jsonify({"error": "volumen must be > 0"}), 422
 
     if estado and (bloqueo := _bloqueo_arranque()):
+        return bloqueo
+    if estado and (bloqueo := _bloqueo_nivel(REQ_NIVEL["llenado_mix"])):
         return bloqueo
 
     if estado:
