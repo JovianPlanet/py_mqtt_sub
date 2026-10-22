@@ -5,6 +5,7 @@ import sys
 import time
 import threading
 import requests
+from contextlib import AsyncExitStack
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
 import paho.mqtt.client as mqtt
@@ -47,6 +48,10 @@ T_FILL_MAX_S   = int(os.getenv("T_FILL_MAX_S",   3600)) # timeout de seguridad m
 T_OZ           = int(os.getenv("T_OZ",           300))
 T_DOSIFICACION = int(os.getenv("T_DOSIFICACION",  51))
 
+# Apagado garantizado de actuadores: nº de intentos y espera máxima entre ellos (s)
+APAGADO_INTENTOS   = 6
+APAGADO_ESPERA_MAX = 15
+
 MIXING_TANK_TOPIC       = "mixing_tank"
 DISTRIBUTION_TANK_TOPIC = "distribution_tank/+"
 REQUEST_TOPIC = "request"
@@ -84,6 +89,11 @@ _fill_active = threading.Event()
 
 # Señal de conexión MQTT — se activa en on_connect, se limpia en on_disconnect
 _mqtt_connected = threading.Event()
+
+# Parada de emergencia: cada parada incrementa la generación; las secuencias la
+# capturan al iniciar y se interrumpen en cuanto cambia.
+_parada_gen = 0
+_parada_lock = threading.Lock()
 
 
 def _safe_response_body(r):
@@ -164,56 +174,162 @@ def _tankmix_client() -> TankMixClient:
     )
 
 
+def _cliente(placa: str):
+    """placa: "a64" (a64_prod) o "tankmix" (tank-mix)."""
+    return _a64_client() if placa == "a64" else _tankmix_client()
+
+
+# ── Actuación segura ──────────────────────────────────────────────────────────
+# Cada secuencia mantiene abierta la conexión con la placa mientras sus salidas
+# están encendidas y, termine como termine, apaga con _asegurar_apagado().
+
+def _motivo_corte(gen: int, clientes=(), mientras=None):
+    """Devuelve el motivo para interrumpir una secuencia, o None si puede seguir."""
+    if gen != _parada_gen:
+        return "Parada de emergencia"
+    if mientras is not None and not mientras.is_set():
+        return "Detenido externamente"
+    for c in clientes:
+        if not c.connected:
+            return f"Comunicación perdida con {c.label}"
+    return None
+
+
+async def _esperar(segundos: float, gen: int, clientes=(), evento=None, mientras=None) -> str:
+    """
+    Espera en pasos cortos para poder reaccionar a tiempo. Devuelve "ok" si se
+    cumplió el tiempo, "evento" si `evento` se activó antes, o el motivo de corte.
+    """
+    fin = time.monotonic() + segundos
+    while True:
+        motivo = _motivo_corte(gen, clientes, mientras)
+        if motivo:
+            return motivo
+        if evento is not None and evento.is_set():
+            return "evento"
+        restante = fin - time.monotonic()
+        if restante <= 0:
+            return "ok"
+        await asyncio.sleep(min(0.5, restante))
+
+
+async def _asegurar_apagado(pasos, vivos=None) -> bool:
+    """
+    Apaga las salidas `pasos` ([(placa, nombre), ...]) en el orden dado y verifica
+    que la placa confirme OFF. Reutiliza las conexiones de `vivos` mientras sigan
+    activas; si no, abre conexiones nuevas. Reintenta con espera creciente.
+    Devuelve True si todas quedaron confirmadas en OFF.
+    """
+    pendientes = list(pasos)
+    vivos = dict(vivos or {})
+    for intento in range(1, APAGADO_INTENTOS + 1):
+        restantes = []
+        pila = AsyncExitStack()
+        try:
+            conexiones = {}
+            for placa in dict.fromkeys(p for p, _ in pendientes):
+                cli = vivos.get(placa)
+                if cli is not None and cli.connected:
+                    conexiones[placa] = cli
+                    continue
+                try:
+                    conexiones[placa] = await pila.enter_async_context(_cliente(placa))
+                except Exception as e:
+                    print(f"[SEGURIDAD] Intento {intento}: sin conexión con {placa}: {e}")
+            for placa, nombre in pendientes:
+                cli = conexiones.get(placa)
+                if cli is None:
+                    restantes.append((placa, nombre))
+                    continue
+                try:
+                    if not await cli.set_switch_confirmed(nombre, False):
+                        restantes.append((placa, nombre))
+                except KeyError:
+                    print(f"[SEGURIDAD] {nombre} no existe en {placa}; se omite.")
+                except Exception as e:
+                    print(f"[SEGURIDAD] Intento {intento}: error apagando {nombre}: {e}")
+                    restantes.append((placa, nombre))
+        finally:
+            try:
+                await pila.aclose()
+            except Exception as e:
+                print(f"[SEGURIDAD] Aviso al cerrar conexiones: {e}")
+        pendientes = restantes
+        vivos = {}   # si algo falló, el siguiente intento usa conexiones nuevas
+        if not pendientes:
+            return True
+        if intento < APAGADO_INTENTOS:
+            await asyncio.sleep(min(2 ** intento, APAGADO_ESPERA_MAX))
+    print(f"[SEGURIDAD] CRÍTICO: no se pudo confirmar el apagado de "
+          f"{[n for _, n in pendientes]}. Usar la parada manual.")
+    return False
+
+
+async def _pulso(etiqueta: str, pasos, duracion: float):
+    """
+    Enciende `pasos` ([(placa, nombre), ...]) en orden, espera `duracion` s
+    (interrumpible) y apaga en orden inverso con _asegurar_apagado().
+    Devuelve None si terminó normalmente o el motivo de la interrupción.
+    """
+    gen = _parada_gen
+    apagado = list(reversed(pasos))
+    vivos = {}
+    activado = False
+    pila = AsyncExitStack()
+    try:
+        for placa in dict.fromkeys(p for p, _ in pasos):
+            vivos[placa] = await pila.enter_async_context(_cliente(placa))
+        activado = True
+        for placa, nombre in pasos:
+            if not await vivos[placa].set_switch_confirmed(nombre, True):
+                raise RuntimeError(f"{nombre} no confirmó el encendido")
+        motivo = await _esperar(duracion, gen, list(vivos.values()))
+        if motivo != "ok":
+            print(f"[SEGURIDAD] {etiqueta} interrumpido: {motivo}. Apagando.")
+        activado = False   # a partir de aquí el apagado se gestiona en esta misma rama
+        await _asegurar_apagado(apagado, vivos)
+        return None if motivo == "ok" else motivo
+    finally:
+        if activado:   # salida por excepción con salidas posiblemente encendidas
+            print(f"[SEGURIDAD] {etiqueta}: error durante la secuencia. Asegurando apagado.")
+            await _asegurar_apagado(apagado, vivos)
+        try:
+            await pila.aclose()
+        except Exception as e:
+            print(f"[SEGURIDAD] Aviso al cerrar conexiones ({etiqueta}): {e}")
+
+
 # ── Secuencias async ──────────────────────────────────────────────────────────
+# Orden de encendido: válvula y luego bomba; el apagado va en orden inverso.
 
 async def _suction_sequence(balsa: int) -> None:
     ev_out = f"EV_OUT_BAND_{balsa:02d}"
     print(f"[A64] Iniciando succion: {ev_out} + A_MB_Succion ({T_SUCCION}s)")
-    async with _a64_client() as a64:
-        await a64.turn_on(ev_out)
-        await a64.turn_on("A_MB_Succion ")
-        await asyncio.sleep(T_SUCCION)
-        await a64.turn_off("A_MB_Succion ")
-        await a64.turn_off(ev_out)
+    motivo = await _pulso("Succión", [("a64", ev_out), ("a64", "A_MB_Succion ")], T_SUCCION)
+    if motivo:
+        raise RuntimeError(f"succión interrumpida ({motivo})")
     print(f"[A64] Succion finalizada: {ev_out}")
 
 
 async def _transferir_dist_mix_sequence() -> None:
     print(f"[A64] Iniciando transferencia dist→mix: A_MB200 + A_EV_OUT_NUTRICION ({T_MB200}s)")
-    async with _a64_client() as a64:
-        await a64.turn_on("A_MB200")
-        await a64.turn_on("A_EV_OUT_NUTRICION")
-        await asyncio.sleep(T_MB200)
-        await a64.turn_off("A_EV_OUT_NUTRICION")
-        await a64.turn_off("A_MB200")
-    print("[A64] Transferencia dist→mix finalizada")
+    motivo = await _pulso("Transferencia dist→mix",
+                          [("a64", "A_EV_OUT_NUTRICION"), ("a64", "A_MB200")], T_MB200)
+    print("[A64] Transferencia dist→mix " + (f"interrumpida ({motivo})" if motivo else "finalizada"))
 
 
 async def _transferir_mix_dist_sequence() -> None:
     print(f"[TANKMIX] Iniciando transferencia mix→dist: A_EV_IN_NUTRICION + MOTOBOMBA ({T_MBMIX}s)")
-    async with _a64_client() as a64, _tankmix_client() as tmix:
-        await asyncio.gather(
-            a64.turn_on("A_EV_IN_NUTRICION"),
-            tmix.turn_on("Motobomba"),
-        )
-        await asyncio.sleep(T_MBMIX)
-        await asyncio.gather(
-            a64.turn_off("A_EV_IN_NUTRICION"),
-            tmix.turn_off("Motobomba"),
-        )
-    print("[TANKMIX] Transferencia mix→dist finalizada")
+    motivo = await _pulso("Transferencia mix→dist",
+                          [("a64", "A_EV_IN_NUTRICION"), ("tankmix", "Motobomba")], T_MBMIX)
+    print("[TANKMIX] Transferencia mix→dist " + (f"interrumpida ({motivo})" if motivo else "finalizada"))
 
 
 async def _llenar_sequence(balsa: int) -> None:
     ev_in = f"EV_IN_BAND_{balsa:02d}"
     print(f"[A64] Iniciando llenado: {ev_in} + A_MB200 ({T_MB200}s)")
-    async with _a64_client() as a64:
-        await a64.turn_on(ev_in)
-        await a64.turn_on("A_MB200")
-        await asyncio.sleep(T_MB200)
-        await a64.turn_off("A_MB200")
-        await a64.turn_off(ev_in)
-    print(f"[A64] Llenado finalizado: {ev_in}")
+    motivo = await _pulso(f"Llenado balsa {balsa}", [("a64", ev_in), ("a64", "A_MB200")], T_MB200)
+    print(f"[A64] Llenado {f'interrumpido ({motivo})' if motivo else 'finalizado'}: {ev_in}")
 
 
 async def _luminaria_sequence(modulo: str, tanque: int, balsa: int, estado: int) -> None:
@@ -257,41 +373,117 @@ async def _agitador_sequence(tanque: int, estado: bool) -> None:
         print(f"[AGITADOR] Agitador (tank-mix) {'encendido' if estado else 'apagado'}")
 
 
-async def _open_epm() -> None:
-    async with _tankmix_client() as tmix:
-        await tmix.turn_on("Entrada EPM")
-    print("[TANKMIX] Entrada EPM abierta")
+async def _solicitar_nivel_mix(modulo: str, gen: int, tmix):
+    """
+    Pide una medición al nodo del tanque mix y espera la respuesta.
+    Devuelve (nivel_L, None), (None, None) si no hubo respuesta, o
+    (None, motivo) si hay que interrumpir el llenado.
+    """
+    if not _mqtt_connected.is_set():
+        print(f"[ENTRADA_AGUA] Sin conexión MQTT. Reintentando en {T_FILL_POLL_S} s...")
+        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+        return None, (None if r == "ok" else r)
+
+    _mix_level_event.clear()
+    req = {"modulo": modulo, "tanque": 2, "balsa": 0}
+    result = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
+    publicado = result.rc == mqtt.MQTT_ERR_SUCCESS
+    if publicado:
+        try:
+            await asyncio.to_thread(result.wait_for_publish, 10)
+        except Exception:
+            pass
+        publicado = result.is_published()
+    if not publicado:
+        print(f"[ENTRADA_AGUA] No se pudo publicar la solicitud de nivel. Reintentando en {T_FILL_POLL_S} s")
+        r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+        return None, (None if r == "ok" else r)
+
+    r = await _esperar(60, gen, [tmix], evento=_mix_level_event, mientras=_fill_active)
+    if r == "evento":
+        with _last_mix_level_lock:
+            return _last_mix_level, None
+    if r == "ok":
+        print("[ENTRADA_AGUA] Sin respuesta del ESP32 en 60 s. Reintentando...")
+        return None, None
+    return None, r
 
 
-async def _close_epm() -> None:
-    async with _tankmix_client() as tmix:
-        await tmix.turn_off("Entrada EPM")
-    print("[TANKMIX] Entrada EPM cerrada")
+async def _llenado_mix(modulo: str, volumen: int) -> None:
+    """
+    Abre Entrada EPM manteniendo la conexión con tank-mix durante todo el llenado
+    y la cierra (con garantía) al alcanzar el volumen, al detenerse externamente,
+    ante una parada de emergencia, si se pierde la comunicación con la placa o al
+    cumplirse T_FILL_MAX_S.
+    """
+    gen = _parada_gen
+    pasos = [("tankmix", "Entrada EPM")]
+    vivos = {}
+    activado = False
+    pila = AsyncExitStack()
+    try:
+        tmix = await pila.enter_async_context(_cliente("tankmix"))
+        vivos = {"tankmix": tmix}
+        activado = True
+        if not await tmix.set_switch_confirmed("Entrada EPM", True):
+            raise RuntimeError("Entrada EPM no confirmó la apertura")
+        print("[TANKMIX] Entrada EPM abierta")
+        print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
+
+        t_inicio = time.time()
+        while True:
+            if time.time() - t_inicio >= T_FILL_MAX_S:
+                motivo = f"Timeout de seguridad ({T_FILL_MAX_S}s)"
+                break
+            nivel, motivo = await _solicitar_nivel_mix(modulo, gen, tmix)
+            if motivo:
+                break
+            if nivel is None:
+                continue
+            elapsed = int(time.time() - t_inicio)
+            print(f"[ENTRADA_AGUA] Nivel: {nivel:.2f} L / objetivo: {volumen} L (t={elapsed}s)")
+            if nivel >= volumen:
+                motivo = "Volumen alcanzado"
+                break
+            r = await _esperar(T_FILL_POLL_S, gen, [tmix], mientras=_fill_active)
+            if r != "ok":
+                motivo = r
+                break
+
+        print(f"[ENTRADA_AGUA] {motivo}. Cerrando Entrada EPM.")
+        activado = False
+        if await _asegurar_apagado(pasos, vivos):
+            print("[TANKMIX] Entrada EPM cerrada")
+    finally:
+        if activado:   # salida por excepción con la válvula posiblemente abierta
+            print("[ENTRADA_AGUA] Error durante el llenado. Asegurando el cierre de Entrada EPM.")
+            if await _asegurar_apagado(pasos, vivos):
+                print("[TANKMIX] Entrada EPM cerrada")
+        try:
+            await pila.aclose()
+        except Exception as e:
+            print(f"[SEGURIDAD] Aviso al cerrar la conexión con tank-mix: {e}")
 
 
 async def _ozono_sequence(estado: bool) -> None:
-    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} Ozono")
-    async with _tankmix_client() as tmix:
-        if estado:
-            await tmix.turn_on("Ozono")
-            await asyncio.sleep(T_OZ)
-            await tmix.turn_off("Ozono")
-        else:
-            await tmix.turn_off("Ozono")
-    print(f"[TANKMIX] Ozono {'completado' if estado else 'apagado'}")
+    if not estado:
+        await _asegurar_apagado([("tankmix", "Ozono")])
+        print("[TANKMIX] Ozono apagado")
+        return
+    print("[TANKMIX] Activando Ozono")
+    motivo = await _pulso("Ozono", [("tankmix", "Ozono")], T_OZ)
+    print(f"[TANKMIX] Ozono {f'interrumpido ({motivo})' if motivo else 'completado'}")
 
 
 async def _peris_sequence(peris: int, estado: bool) -> None:
     name = f"Peris_{peris}"
-    print(f"[TANKMIX] {'Activando' if estado else 'Desactivando'} {name}")
-    async with _tankmix_client() as tmix:
-        if estado:
-            await tmix.turn_on(name)
-            await asyncio.sleep(T_DOSIFICACION)
-            await tmix.turn_off(name)
-        else:
-            await tmix.turn_off(name)
-    print(f"[TANKMIX] {name} {'completado' if estado else 'apagado'}")
+    if not estado:
+        await _asegurar_apagado([("tankmix", name)])
+        print(f"[TANKMIX] {name} apagado")
+        return
+    print(f"[TANKMIX] Activando {name}")
+    motivo = await _pulso(name, [("tankmix", name)], T_DOSIFICACION)
+    print(f"[TANKMIX] {name} {f'interrumpido ({motivo})' if motivo else 'completado'}")
 
 
 # ── Thread starters ───────────────────────────────────────────────────────────
@@ -416,86 +608,29 @@ def _start_agitador_sequence(tanque: int, estado: bool) -> None:
 def _start_entrada_agua_sequence(modulo: str, volumen: int, estado: bool) -> None:
     """
     Corre en un thread daemon.
-    estado=False: cierra Entrada EPM inmediatamente y aborta cualquier llenado activo.
-    estado=True:  abre Entrada EPM y monitorea el nivel del tanque mix via MQTT.
-                  Cierra la válvula cuando nivel >= volumen o al cumplirse T_FILL_MAX_S.
+    estado=False: detiene el llenado activo (si lo hay) y asegura el cierre de Entrada EPM.
+    estado=True:  ejecuta _llenado_mix(): abre Entrada EPM, monitorea el nivel del
+                  tanque mix vía MQTT y cierra al alcanzar el volumen o ante cualquier
+                  condición de corte (ver _llenado_mix).
     """
     if not estado:
-        _fill_active.clear()
+        _fill_active.clear()   # el llenado en curso cierra la válvula al salir
         try:
-            asyncio.run(_close_epm())
+            ok = asyncio.run(_asegurar_apagado([("tankmix", "Entrada EPM")]))
+            print("[TANKMIX] Entrada EPM cerrada" if ok
+                  else "[TANKMIX] No se pudo confirmar el cierre de Entrada EPM")
         except Exception as e:
             print(f"[TANKMIX] Error cerrando Entrada EPM: {e}")
         return
 
     # _fill_active ya fue reservado sincrónicamente por el handler (cierra el
-    # hueco con /medir t2). Si falla la apertura de la válvula, lo liberamos.
+    # hueco con /medir t2); se libera siempre al terminar.
     try:
-        asyncio.run(_open_epm())
+        asyncio.run(_llenado_mix(modulo, volumen))
     except Exception as e:
-        print(f"[TANKMIX] Error abriendo Entrada EPM: {e}")
+        print(f"[ENTRADA_AGUA] Error en el llenado: {e}")
+    finally:
         _fill_active.clear()
-        return
-
-    print(f"[ENTRADA_AGUA] Monitoreo iniciado. Objetivo: {volumen} L")
-
-    t_inicio = time.time()
-    alcanzado = False
-
-    while _fill_active.is_set() and (time.time() - t_inicio) < T_FILL_MAX_S:
-        # Esperar conexión MQTT antes de sondear
-        if not _mqtt_connected.wait(timeout=30):
-            print("[ENTRADA_AGUA] Sin conexión MQTT. Reintentando en 30 s...")
-            time.sleep(T_FILL_POLL_S)
-            continue
-
-        # Solicitar medición al ESP32 del tanque mix
-        _mix_level_event.clear()
-        req = {"modulo": modulo, "tanque": 2, "balsa": 0}
-        result = client.publish(REQUEST_TOPIC, json.dumps(req), qos=1)
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            print(f"[ENTRADA_AGUA] MQTT publish fallido (rc={result.rc}). Reintentando en {T_FILL_POLL_S}s")
-            time.sleep(T_FILL_POLL_S)
-            continue
-        try:
-            result.wait_for_publish(timeout=10)
-        except Exception:
-            pass
-        if not result.is_published():
-            print(f"[ENTRADA_AGUA] Broker no confirmó entrega. Reintentando en {T_FILL_POLL_S}s")
-            time.sleep(T_FILL_POLL_S)
-            continue
-
-        # Esperar respuesta del ESP32 (máx 60 s)
-        got = _mix_level_event.wait(timeout=60)
-        if not got:
-            print("[ENTRADA_AGUA] Sin respuesta del ESP32 en 60 s. Reintentando...")
-            continue
-
-        with _last_mix_level_lock:
-            nivel_actual = _last_mix_level
-
-        elapsed = int(time.time() - t_inicio)
-        print(f"[ENTRADA_AGUA] Nivel: {nivel_actual:.2f} L / objetivo: {volumen} L (t={elapsed}s)")
-
-        if nivel_actual >= volumen:
-            alcanzado = True
-            _fill_active.clear()
-            break
-
-        # Esperar el intervalo configurado antes del próximo sondeo
-        time.sleep(T_FILL_POLL_S)
-
-    motivo = "Volumen alcanzado" if alcanzado else \
-             "Detenido externamente" if not _fill_active.is_set() else \
-             f"Timeout de seguridad ({T_FILL_MAX_S}s)"
-    print(f"[ENTRADA_AGUA] {motivo}. Cerrando Entrada EPM.")
-    _fill_active.clear()
-
-    try:
-        asyncio.run(_close_epm())
-    except Exception as e:
-        print(f"[TANKMIX] Error cerrando Entrada EPM: {e}")
 
 
 def _start_ozono_sequence(estado: bool) -> None:

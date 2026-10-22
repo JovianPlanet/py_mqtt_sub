@@ -114,6 +114,7 @@ class TankMixClient:
         self._state_by_key: Dict[int, bool] = {}
 
         self._connected = False
+        self.label = "tank-mix"
 
     # ---- context manager ------------------------------------------------
     async def __aenter__(self) -> "TankMixClient":
@@ -127,7 +128,7 @@ class TankMixClient:
     async def connect(self) -> None:
         log.info("Conectando a tank-mix en %s:%s ...", self._host, self._port)
         try:
-            await self._client.connect(login=True)
+            await self._client.connect(on_stop=self._on_stop, login=True)
         except InvalidEncryptionKeyAPIError as e:
             raise RuntimeError(
                 "Encryption key inválida: comprobá TANKMIX_NOISE_KEY o el YAML."
@@ -162,6 +163,16 @@ class TankMixClient:
             await self._client.disconnect()
             self._connected = False
 
+    async def _on_stop(self, expected_disconnect: bool) -> None:
+        """Llamado por aioesphomeapi cuando la conexión termina (esperada o no)."""
+        if self._connected and not expected_disconnect:
+            log.warning("Conexión con %s (%s) perdida", self.label, self._host)
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
     # ---- callbacks internos --------------------------------------------
     def _on_state(self, state: EntityState) -> None:
         if isinstance(state, SwitchState):
@@ -194,6 +205,18 @@ class TankMixClient:
         key = self._switch_key(name)
         log.info("-> %s := %s", name, "ON" if on else "OFF")
         self._client.switch_command(key, on)
+
+    async def set_switch_confirmed(self, name: str, on: bool, timeout: float = 3.0) -> bool:
+        """Envía el comando y espera a que la placa reporte el estado pedido."""
+        key = self._switch_key(name)
+        await self.set_switch(name, on)
+        loop = asyncio.get_running_loop()
+        fin = loop.time() + timeout
+        while loop.time() < fin:
+            if self._state_by_key.get(key) == on:
+                return True
+            await asyncio.sleep(0.05)
+        return self._state_by_key.get(key) == on
 
     async def turn_on(self, name: str) -> None:
         await self.set_switch(name, True)
